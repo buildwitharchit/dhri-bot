@@ -149,7 +149,8 @@ async def run_seed_ingest(file_path: str) -> None:
             'option_traps': q.get('option_traps') or {},
             'one_line_technique': q['one_line_technique'],
             'taxonomy_version': 1,
-            'tagged_at': datetime.now(timezone.utc),
+            # schema.sql declares `tagged_at TIMESTAMP` (naive). Strip tz.
+            'tagged_at': datetime.now(timezone.utc).replace(tzinfo=None),
             'tagger_model': 'manual_pyq_v4',
             'connector_type': q.get('connector_type'),
             'opening_clue': q.get('opening_clue'),
@@ -202,7 +203,7 @@ async def run_full_ingest(file_path: str, *, skip_verifier: bool = False) -> Non
                 tags['one_line_technique'] = technique.strip()
 
             tags.setdefault('taxonomy_version', 1)
-            tags['tagged_at'] = datetime.now(timezone.utc)
+            tags['tagged_at'] = datetime.now(timezone.utc).replace(tzinfo=None)
             tags['tagger_model'] = (
                 f"{settings.MODEL_TAGGER_STRUCTURED}+{settings.MODEL_TAGGER_TECHNIQUE}"
             )
