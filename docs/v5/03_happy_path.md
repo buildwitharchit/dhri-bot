@@ -1,0 +1,1208 @@
+# Happy Paths — DHRI v5
+
+## Overview
+
+This document traces specific user interactions through every service. It validates that the data model and service contracts compose into working behavior. If a trace doesn't make sense, the architecture has a gap.
+
+Five traces are documented, in order of importance:
+
+1. **First-time user (onboarding flow)** — most critical to get right
+2. **Returning user, normal practice** — the most common flow
+3. **Mid-session topic switch** — tests context-switching
+4. **Wrong answer with pattern recall** — tests profile injection (the "wow" moment)
+5. **Off-topic query (guardrails)** — tests the soft-redirect
+
+Plus shorter notes on:
+- Repeat-question fallback scenario
+- Returning after a long break
+- Rate limit hit
+- Session-end pipeline (background)
+
+---
+
+## Trace 1: First-Time User Onboarding
+
+### Scenario
+
+Archit has never used dhri. He clicks the bot link from a Reddit post, opens Telegram, and taps "Start" or types `/start`. Goal: complete onboarding, take the diagnostic test, get welcomed properly. Total time: ~5-7 minutes.
+
+---
+
+### Step 1: First message arrives
+
+User sends `/start` to bot.
+
+- Service: Telegram → Bus
+- Bus normalizes:
+  ```
+  { tg_id: 123456789, content: "/start", content_type: "text", 
+    timestamp: now, source_metadata: {...} }
+  ```
+- Bus sends "🤔 Thinking..." to Telegram, captures thinking_message_id = 1
+- Bus sends `chatAction("typing")`
+- Bus calls `orchestrator.handle_message(payload, thinking_message_id=1)`
+
+### Step 2: Orchestrator: identity resolution
+
+- Look up tg_id = 123456789 in `students` table → not found
+- Create new student:
+  ```sql
+  INSERT INTO students (tg_id, display_name, created_at, last_seen_at) 
+  VALUES (123456789, 'Archit', now(), now())
+  RETURNING student_id
+  ```
+- student_id = `uuid-archit-1`
+- Acquire lock: `SET lock:user:123456789 1 NX EX 5` → OK
+
+### Step 3: Persist user message
+
+- Insert into messages:
+  ```
+  message_id: msg-uuid-1
+  student_id: uuid-archit-1
+  session_id: null (no session yet)
+  role: 'user'
+  content: '/start'
+  content_type: 'text'
+  metadata: {tg_message_id: ..., raw_telegram_payload: {...}}
+  ```
+
+### Step 4: Rate limit checks
+
+- INCR `ratelimit:tg:123456789:2026-04-25` → 1
+- 1 < 500, OK
+- INCR per-minute → 1, < 5, OK
+- spend cap not relevant yet (no LLM calls made)
+
+### Step 5: Onboarding check
+
+- Call `profile_service.ensure_profile(uuid-archit-1)`:
+  - SELECT from student_profile → not found
+  - INSERT default row:
+    ```
+    student_id: uuid-archit-1
+    target_exam: 'CAT'
+    target_year: null
+    onboarding_complete: false
+    onboarding_step: null
+    ```
+  - Return row
+- Check onboarding_complete = false → route to `handle_onboarding_step`
+
+### Step 6: Onboarding FSM — start_onboarding
+
+- current_step = null
+- Set onboarding_step = 'start_onboarding', onboarding_started_at = now()
+- Compose response:
+  ```
+  Welcome to DHRI 👋
+  
+  I'm your AI tutor for CAT VARC. I'll help you practice 
+  reading comprehension, para jumbles, and verbal ability questions — 
+  the kind that show up in CAT.
+  
+  Quick onboarding (about 7 minutes), then we'll do a 5-question test 
+  so I can understand your level. Ready?
+  ```
+- Inline keyboard: `[Let's start]`
+- Return AgentResponse to orchestrator
+
+### Step 7: Orchestrator: persist assistant message + commit
+
+- Insert into messages: role='assistant', content=welcome
+- No session created yet (onboarding doesn't create sessions until diagnostic)
+- Increment ratelimit (outgoing)
+- Return response to bus
+
+### Step 8: Bus delivers
+
+- Format response with MarkdownV2 + inline keyboard
+- `bot.editMessageText(thinking_message_id=1, content, ...)` → replaces "🤔 Thinking..." with welcome
+- Release lock: `DEL lock:user:123456789`
+
+**User sees:** Welcome message with "Let's start" button. Total elapsed: ~1.5 seconds (no LLM calls in onboarding FSM, very fast).
+
+---
+
+### Step 9: User taps "Let's start"
+
+- Telegram callback_query payload
+- Bus normalizes: `content: "ONBOARDING_START_CONFIRMED", content_type: "button"`
+- Bus sends thinking, calls orchestrator
+
+### Step 10: Orchestrator routes to onboarding handler
+
+- ensure_profile, check onboarding_complete = false
+- Route to handle_onboarding_step
+- current_step = 'start_onboarding'
+- Advance to 'ask_name'
+- Compose:
+  ```
+  What should I call you?
+  
+  I see "Archit" on Telegram — works for me, or pick something else.
+  ```
+- Inline keyboard: `[Use "Archit"]` `[Type a different name]`
+
+### Step 11: User taps "Use 'Archit'"
+
+- Through bus → orchestrator
+- handle_onboarding_step: current_step = 'ask_name'
+- save display_name = 'Archit' to students table (already set, but idempotent)
+- Advance to 'ask_target_year'
+- Compose:
+  ```
+  Which CAT year are you targeting?
+  ```
+- Inline keyboard: `[2026]` `[2027]` `[2028]`
+
+### Step 12: User taps "2026"
+
+- handle_onboarding_step: current_step = 'ask_target_year'
+- UPDATE student_profile SET target_year = 2026
+- Advance to 'ask_experience_level'
+- Response: question + buttons `[Working professional]` `[Final-year student]` `[College student]` `[Dropper]` `[Fresher]`
+
+### Step 13-16: Continue FSM through profile fields
+
+- ask_experience_level → "Working professional"
+- ask_preparation_stage → "Mid-prep"
+- ask_hours_per_day → "2-4 hours"
+- ask_target_colleges → multi-select with [IIM-A] [IIM-B] [IIM-C] [IIM-L] [IIM-K] [Others] [Skip]
+  - User taps multiple, then "Done"
+- ask_why_cat → "Skip" (user skips this optional one)
+
+After each step:
+- UPDATE student_profile with new field
+- Advance onboarding_step
+- Compose next prompt
+
+### Step 17: Diagnostic intro
+
+- current_step = 'ask_why_cat' completed (or skipped)
+- Advance to 'diagnostic_intro'
+- Compose:
+  ```
+  Last thing — let's do a quick 5-question diagnostic test.
+  
+  This helps me understand where you are right now and personalize 
+  your practice. Should take about 5-7 minutes.
+  
+  Take it now, or skip and start fresh?
+  ```
+- Buttons: `[Take 5-question test]` `[Skip the test]`
+
+### Step 18: User taps "Take 5-question test"
+
+- handle_onboarding_step: current_step = 'diagnostic_intro'
+- Advance to 'diagnostic_q1'
+- **Now we delegate to VARC agent**:
+  - Call `varc_agent.serve_diagnostic_question(student_id, q_index=1)`
+
+### Step 19: VARC agent serves diagnostic Q1
+
+- Criteria: easy inference question, unseen
+- Retrieve via tier 1 (high-confidence match)
+- Found: question about a passage on conservation biology, easy inference
+- Compose presentation:
+  ```
+  **Question 1 of 5** (Easy)
+  
+  *Passage:* [Short passage text — 150 words]
+  
+  *Question:* Which of the following can be inferred from the passage?
+  
+  A) [Option A]
+  B) [Option B]
+  C) [Option C]
+  D) [Option D]
+  ```
+- Inline keyboard: `[A]` `[B]` `[C]` `[D]`
+- Return AgentResponse with:
+  - content: presentation
+  - keyboard: A/B/C/D
+  - memory_deltas:
+    - new_session: { primary_agent: 'varc', started_at: now }
+    - active_context_updates: { domain_state: { passage_id, current_question_id, current_question_index: 0 } }
+
+### Step 20: Orchestrator commits
+
+- Persist assistant message
+- Insert new session row (this is the first real session — created during diagnostic)
+- Update Redis active session
+- Track this session in onboarding context
+
+### Step 21: User taps "B"
+
+Goes through bus → orchestrator → handle_onboarding_step.
+
+- current_step = 'diagnostic_q1'
+- Delegate to `varc_agent.handle_diagnostic_answer(student_id, 'diagnostic_q1', payload)`
+
+### Step 22: VARC agent handles answer
+
+- Read active session domain_state: current question_id
+- Look up correct answer: B
+- User's answer: B → correct!
+- Compose brief explanation:
+  ```
+  ✓ Correct!
+  
+  Quick explanation: [2-3 sentences on why B is right and what trap C 
+  was setting up — keep it tight to maintain test momentum]
+  
+  Question 2 of 5 coming up...
+  ```
+- Record attempt:
+  ```
+  INSERT INTO attempts (student_id, question_id, selected_option, correct, ...)
+  ```
+- Update student_skill_profile with this attempt
+- Update onboarding_step = 'diagnostic_q2'
+- Recursively call serve_diagnostic_question for q2
+
+OR (in cleaner implementation): Return response with explanation, then orchestrator advances onboarding_step, sets active_context for next question, AND triggers serving q2 in a follow-up message OR appended to current response.
+
+For simplicity in v1: Return one response with both explanation AND next question presented. Single Telegram message:
+```
+✓ Correct!
+
+[Brief explanation]
+
+---
+
+**Question 2 of 5** (Easy)
+
+[Q2 presentation]
+
+A) ... B) ... C) ... D) ...
+```
+
+### Steps 23-29: Repeat for Q2-Q5
+
+Same pattern. Each turn:
+- User taps option → orchestrator → varc_agent.handle_diagnostic_answer
+- Agent: explanation + next question (or transition message after Q5)
+- Record attempt
+- Advance onboarding_step
+
+### Step 30: After Q5 answered
+
+- handle_diagnostic_answer for q5 returns explanation
+- Advance onboarding_step = 'mentor_synthesis'
+- Compose response: explanation + transition note "Let me look at your overall results..."
+
+The next message arrival (or proactive trigger?) brings mentor in.
+
+**Design note:** For UX continuity, treat mentor_synthesis as a follow-up message sent immediately after q5 explanation. Two options:
+
+**Option A (cleaner):** Send q5 explanation, then send a SECOND message from mentor with synthesis.
+- Bus sends explanation as the response to q5 answer
+- Orchestrator triggers async task: after sending response, immediately call `mentor_agent.synthesize_diagnostic` and send result as new message via `bus.send_to_telegram` (no thinking message — direct send)
+
+**Option B (simpler):** User has to tap a "See my results" button after q5, which triggers mentor.
+
+Choose Option A for v1. Better UX. Worth the slight implementation complexity.
+
+### Step 31: Mentor synthesizes diagnostic
+
+- Triggered by orchestrator after sending q5 response
+- Load 5 attempts from current session
+- Identify: 4/5 correct, weakest = inference (medium difficulty wrong), strongest = main_idea
+- Trap pattern: out_of_scope on the medium inference question
+- Compose synthesis prompt for LLM:
+  ```
+  [The synthesis prompt from service contracts doc]
+  ```
+- Call MODEL_CHAT (Sonnet — important first impression)
+- LLM returns synthesis like:
+  ```
+  Nice work, Archit. 4 out of 5 — solid baseline.
+  
+  Your strongest area looks like main idea (you got both of those right 
+  with confidence). Where I'd focus our work is medium-difficulty 
+  inference — you fell for an out-of-scope option, which is one of 
+  the most common CAT VARC traps.
+  
+  Plan: I'll start serving you inference questions tuned to that pattern. 
+  We'll work on it together.
+  
+  What sounds good?
+  ```
+- Buttons: `[Practice inference now]` `[Explore main idea instead]` `[Just chat first]`
+- Set onboarding_complete = true, onboarding_completed_at = now(), onboarding_step = null
+- Return AgentResponse
+
+### Step 32: Bus delivers synthesis
+
+- Sends new message (not edit) since this is a follow-up
+- User sees the welcome + synthesis after q5 explanation
+
+### Validation after onboarding
+
+**Database state:**
+```sql
+-- students
+SELECT * FROM students WHERE tg_id = 123456789;
+-- 1 row: display_name='Archit', last_seen_at=recent
+
+-- student_profile
+SELECT * FROM student_profile WHERE student_id = 'uuid-archit-1';
+-- onboarding_complete=true, all fields populated
+
+-- student_notes
+SELECT count(*) FROM student_notes WHERE student_id = 'uuid-archit-1';
+-- 0-1 (depending on whether why_cat was filled)
+
+-- sessions
+SELECT * FROM sessions WHERE student_id = 'uuid-archit-1';
+-- 1 row: primary_agent='varc' (or 'mixed'), ended_at=null (still active during synthesis)
+
+-- messages
+SELECT count(*) FROM messages WHERE student_id = 'uuid-archit-1';
+-- ~30+ messages (10 onboarding turns + 10 diagnostic turns + synthesis)
+
+-- attempts
+SELECT count(*) FROM attempts WHERE student_id = 'uuid-archit-1';
+-- 5 (the 5 diagnostic questions)
+
+-- student_skill_profile
+SELECT * FROM student_skill_profile WHERE student_id = 'uuid-archit-1';
+-- weakest_subskill='inference_basic', basic accuracy stats
+```
+
+**Redis state:**
+```
+state:tg:123456789: { session_id, active_agent='varc', domain_state with last question }
+memory:tg:123456789: list of last ~30 turns
+```
+
+**User experience:**
+- Smooth onboarding (~5-7 min total)
+- Clear questions, easy buttons
+- Diagnostic feels like a quick test, not a chore
+- Synthesis feels personal and informed
+
+### Things that could go wrong
+
+- User abandons mid-onboarding → state preserved, picks up where they left off when they return
+- User types text instead of tapping button → re-prompt with same buttons (graceful)
+- Diagnostic question retrieval fails → fall back to any easy question
+- Mentor synthesis LLM call fails → simpler hardcoded welcome + suggestion to start practicing
+
+---
+
+## Trace 2: Returning User, Normal Practice
+
+### Scenario
+
+Archit has used dhri for 2 weeks. Has 50+ messages, 6 sessions, several notes. Opens Telegram, types "give me an inference question".
+
+---
+
+### Step 1: Message arrives
+
+- Bus normalizes, sends thinking, calls orchestrator
+- thinking_message_id = N
+
+### Step 2: Identity, lock, persist
+
+- Look up student → found, student_id = uuid-archit-1
+- Update last_seen_at
+- Acquire lock
+- Insert user message into messages
+
+### Step 3: Rate limit, spend checks
+
+- Both pass
+
+### Step 4: Onboarding check
+
+- onboarding_complete = true → continue past onboarding handler
+
+### Step 5: Load minimal context
+
+- Read Redis: memory:tg:123456789 → 30 recent turns from last sessions
+- Read Redis: state:tg:123456789
+  - Last session ended yesterday → no active state in Redis (cleared by session-end pipeline)
+- last_activity_at from sessions table > 2 hours ago → start new session
+- Create new session: primary_agent='varc' (defaulting; will be confirmed after planner)
+- session_id = sess-new-1
+- Update messages.session_id for this turn
+- Set Redis state:tg with new session
+
+### Step 6: Planner LLM call
+
+- Build planner prompt:
+  ```
+  Recent conversation (last 10 turns):
+  user: "...what about C?"
+  assistant: "C is wrong because..."
+  user: "ok thanks"
+  assistant: "Anything else?"
+  user: "no I'm good"
+  assistant: "Good session — see you next time"
+  [day passes]
+  user: "give me an inference question"
+  
+  Active session: just started, no domain_state yet
+  
+  Current message: "give me an inference question"
+  ```
+- Call Gemini Flash
+- Returns:
+  ```json
+  {
+    "intent": {
+      "domain": "varc",
+      "action": "practice_request",
+      "continuation": "new_session",
+      "emotional_tone": "neutral",
+      "depth": "full_engagement",
+      "references_past": "none",
+      "specific_focus": "inference"
+    },
+    "context_needs": {
+      "profile": "full",
+      "episodic": {
+        "needed": true,
+        "domains": ["varc"],
+        "topics": ["inference"],
+        "limit": 2
+      },
+      "specific_messages": { "needed": false }
+    },
+    "response_guidance": {
+      "tone": "warm",
+      "should_acknowledge_feeling": false,
+      "should_reference_pattern": true,
+      "session_action": "continue"
+    }
+  }
+  ```
+
+### Step 7: Guardrails
+
+- domain != 'out_of_scope' → continue
+
+### Step 8: Conditional context fetching
+
+In parallel:
+- profile_service.get_tutor_brief(uuid-archit-1) → string (~400 tokens)
+- memory_service.get_episodic_summaries(uuid-archit-1, {domains: ['varc'], topics: ['inference'], limit: 2}) → 2 summaries
+
+### Step 9: Assemble AgentContext
+
+```
+{
+  student_id: uuid-archit-1,
+  display_name: 'Archit',
+  recent_turns: [...10 turns from yesterday's session and earlier...],
+  active_session: {session_id: sess-new-1, primary_agent: 'varc', domain_state: null},
+  profile_brief: "Archit is a working professional preparing for CAT 2026. 
+                  Studies 2-4 hours per day, currently in mid-prep phase.
+                  Performance: 65% overall on VARC. Strong on main idea (78%),
+                  weakest on inference (58%). Most common trap: out_of_scope (7 times).
+                  Current streak: 4 days; longest this month: 9 days.
+                  Context:
+                  - Falls for out-of-scope traps on comparative passages
+                  - Prefers technical/scientific passages over humanities
+                  - Has mentioned work stress in last 2 weeks; sessions have been shorter
+                  Recent activity: yesterday completed 8-question RC set on conservation,
+                  scored 5/8, struggled with inference traps.",
+  episodic_summaries: [
+    "Tuesday session on inference: 4/6 correct. Caught two out-of-scope traps...",
+    "Saturday session on inference vs main idea: focused on distinguishing types..."
+  ],
+  intent: { ... },
+  response_guidance: { ... },
+  current_message: { content: 'give me an inference question', message_id }
+}
+```
+
+### Step 10: Route to VARC agent
+
+- intent.domain = 'varc' → varc_agent.handle(context)
+
+### Step 11: VARC agent processes
+
+- intent.action = 'practice_request'
+- Determine retrieval criteria:
+  - subskill: inference_basic (from intent.specific_focus)
+  - difficulty: medium (since student is mid-prep, default to medium)
+  - profile_signals: prefers_technical_passages, struggles_with_comparative
+- Call _retrieve_question_with_fallback
+  - Tier 1 query: unseen, inference_basic, medium, technical_passage_bonus
+  - Result: question on AI ethics passage (technical)
+  - Returns (question, tier=1)
+
+### Step 12: VARC agent composes response
+
+Build prompt:
+```
+You are DHRI, a CAT VARC tutor with a warm, specific, coaching personality.
+You remember students; you reference patterns; you don't lecture.
+
+Student profile:
+{profile_brief}
+
+Recent context:
+{recent_turns_summary}
+
+Episodic context (relevant past sessions):
+{episodic_summaries}
+
+Response guidance:
+- Tone: warm
+- Don't acknowledge feeling
+- DO reference pattern (the out-of-scope trap)
+- This is a session continuation
+
+Current request: "give me an inference question"
+
+Retrieved question:
+[Full passage and question]
+
+Compose your response:
+- Brief warm intro (1 sentence — acknowledge the request, optionally reference pattern)
+- Present the passage
+- Present the question with options
+- Be direct, no fluff
+```
+
+Call MODEL_CHAT (Haiku):
+- ~2.5s LLM call
+- Returns:
+  ```
+  Picking up where we left off — let's keep working on inference. 
+  This one's on AI ethics, which I know you like. Watch for out-of-scope 
+  options — they've been catching you on comparative passages.
+  
+  *Passage:* [Full passage text]
+  
+  *Question:* Which of the following can be inferred from the author's 
+  argument about algorithmic decision-making?
+  
+  A) [Option A]
+  B) [Option B]
+  C) [Option C]
+  D) [Option D]
+  ```
+
+### Step 13: VARC agent returns AgentResponse
+
+```
+{
+  content: "<above text>",
+  content_type: "text_with_keyboard",
+  keyboard: { A, B, C, D },
+  memory_deltas: {
+    new_assistant_turn: { content, content_type, metadata },
+    active_context_updates: {
+      domain_state: {
+        passage_id: passage-uuid-7,
+        current_question_id: q-uuid-42,
+        questions_in_set: [q-uuid-42, q-uuid-43, q-uuid-44],
+        questions_answered: {},
+        current_question_index: 0
+      }
+    }
+  },
+  observer_events: [
+    { event_type: "session_started", payload: { domain: 'varc', entry_point: 'practice_request' } }
+  ],
+  meta: {
+    agent: 'varc',
+    model_used: 'anthropic/claude-haiku-4.5',
+    input_tokens: 2400,
+    output_tokens: 380,
+    cost_usd: 0.0035,
+    generation_latency_ms: 2500,
+    retrieval_used: true,
+    retrieved_question_id: q-uuid-42,
+    fallback_tier: 1
+  }
+}
+```
+
+### Step 14: Orchestrator commits
+
+- Persist assistant message into messages table
+- Update Redis active session with new domain_state
+- Update sessions table: message_count++, primary_agent='varc'
+- Insert observer event
+
+### Step 15: Increment counters
+
+- ratelimit:tg:123456789:2026-04-25 INCR
+- spend:2026-04-25 INCRBYFLOAT 0.0035 + planner cost ~0.0001 = 0.0036
+
+### Step 16: Return to bus
+
+- bus.send_to_telegram(123456789, response, thinking_message_id)
+- Edit thinking message with response + keyboard
+
+**User sees:** Thinking emoji disappears, replaced with the response. Total elapsed: ~4-5 seconds.
+
+### Step 17: Async post-processing
+
+- mentor_agent.inline_observe(...) runs (lightweight, no LLM call this time)
+- Mark observer event as processed
+- Embedding job queued for the assistant message (it's substantial content)
+
+### Step 18: Release lock
+
+`DEL lock:user:123456789`
+
+### Validation
+
+```sql
+-- New session row exists
+SELECT * FROM sessions WHERE student_id = 'uuid-archit-1' ORDER BY started_at DESC LIMIT 1;
+-- One row, ended_at=null
+
+-- New messages
+SELECT count(*) FROM messages WHERE session_id = 'sess-new-1';
+-- 2 (user + assistant)
+
+-- Attempt: not yet (will be inserted after user answers)
+
+-- Redis
+GET state:tg:123456789
+-- Has session, domain_state with current question
+
+LLEN memory:tg:123456789
+-- 30+ items
+
+-- Spend
+GET spend:2026-04-25
+-- Some value
+```
+
+**User experience:**
+- Bot acknowledged the return naturally ("picking up where we left off")
+- Referenced known preference (technical passages)
+- Referenced known pattern (out-of-scope traps)
+- Felt continuous, not transactional
+
+This is the everyday flow. Should feel smooth.
+
+---
+
+## Trace 3: Mid-Session Topic Switch
+
+### Scenario
+
+Archit is in an active VARC session (3 questions answered). Mid-set, he asks: "wait, can you explain what 'inferred' actually means in CAT context?"
+
+This is a doubt about the current concept, not a request for a new question. Should be handled smoothly, not as a topic switch.
+
+---
+
+### Steps 1-5: Same as Trace 2 (lock, persist, etc.)
+
+Active session exists with domain_state showing they're mid-set.
+
+### Step 6: Planner classifies
+
+```json
+{
+  "intent": {
+    "domain": "varc",
+    "action": "concept_question",
+    "continuation": "continues_current_session",
+    "emotional_tone": "neutral",
+    "depth": "quick_query",
+    "references_past": "current_question",
+    "specific_focus": "inference_concept"
+  },
+  "context_needs": {
+    "profile": "minimal",
+    "episodic": { "needed": false },
+    "specific_messages": { "needed": false }
+  },
+  "response_guidance": {
+    "tone": "warm",
+    "should_acknowledge_feeling": false,
+    "should_reference_pattern": false,
+    "session_action": "continue"
+  }
+}
+```
+
+Planner correctly identifies:
+- This is a concept question, not a switch
+- Use minimal profile (the meta context isn't needed)
+- Don't fetch episodic (not relevant)
+- Tone: warm
+- Session action: continue (we're going back to practice after this)
+
+### Step 7: No guardrail trigger
+
+### Step 8: Fetch minimal profile only
+
+- profile_service.get_minimal_brief → "Archit, working professional, CAT 2026. Weakest: inference (58%). Common trap: out_of_scope."
+
+### Step 9: Assemble context (lighter than Trace 2)
+
+- recent_turns: yes
+- active_session: yes (still in domain_state)
+- profile_brief: minimal
+- episodic_summaries: empty
+- specific_past_messages: empty
+
+### Step 10: Route to VARC
+
+### Step 11: VARC agent processes
+
+- intent.action = 'concept_question'
+- No retrieval needed
+- Compose teaching response:
+  ```
+  Good question — and good instinct to pause. 
+  
+  In CAT, "inference" means: a conclusion you can draw from the passage 
+  using only what's stated, plus reasonable logic. Not what you might 
+  guess or assume from outside knowledge.
+  
+  The trap CAT loves: options that go just slightly beyond what the 
+  passage supports. Those are out-of-scope. Always ask: "did the 
+  author actually say this, or am I extrapolating?"
+  
+  Want to try another inference question with this in mind, or finish 
+  the current set first?
+  ```
+- Inline keyboard: `[Continue current set]` `[New question]`
+- No memory_delta for new question (we didn't change current question)
+- Return AgentResponse
+
+### Step 12: Orchestrator commits
+
+- Persist assistant turn
+- No active context change (still on same question)
+
+### Step 13: User taps "Continue current set"
+
+- Orchestrator processes button press
+- intent: action = 'continue_practice'
+- VARC agent re-presents the current question (or moves to next if they were already done with current)
+
+**User experience:**
+- Asked a doubt, got a clear teaching answer
+- Bot offered to continue or jump to new
+- Session flow not broken
+- Felt like asking a tutor a question mid-class
+
+---
+
+## Trace 4: Wrong Answer with Pattern Recall (the "wow" moment)
+
+### Scenario
+
+Archit answers a question. Picks C. Correct answer is B. C is the out-of-scope trap. He's done this 3 times before.
+
+This is where the profile + episodic memory shine. The response should explicitly call back to past sessions.
+
+---
+
+### Steps 1-7: Standard flow until agent invocation
+
+Planner classifies:
+- domain: varc
+- action: answer_to_question
+- continuation: continues_current_session
+- emotional_tone: neutral
+- response_guidance:
+  - tone: matter_of_fact
+  - should_acknowledge_feeling: false
+  - should_reference_pattern: TRUE ← key flag
+  - session_action: continue
+
+context_needs:
+- profile: full ← important for the wow moment
+- episodic: needed, topics=['inference', 'out_of_scope_traps'], limit=2
+- specific_messages: not needed
+
+### Step 8: Fetch full profile + relevant episodic
+
+profile_brief includes:
+> "Most common trap: out_of_scope (7 times). Falls for out-of-scope traps on comparative passages."
+
+episodic_summaries include:
+> "Tuesday: 4/6 inference, hit out-of-scope on comparative biology passage"
+> "Saturday: focused on distinguishing inference from main idea, struggled with comparative argument structure"
+
+### Step 9: Assemble context
+
+Full profile brief, episodic summaries about the same trap pattern, recent turns showing the question and student picked C.
+
+### Step 10: Route to VARC
+
+### Step 11: VARC agent processes
+
+- intent.action = 'answer_to_question'
+- Read active session domain_state: current question_id = q-uuid-42
+- Look up question, correct answer = B
+- User picked C (from current_message content)
+- Look up trap on option C: trap = "out_of_scope"
+- Match pattern: this trap matches student's known pattern
+
+### Step 12: Compose explanation prompt
+
+System prompt to LLM (Haiku):
+```
+You are DHRI, a warm and specific CAT VARC tutor.
+
+Student profile:
+{full profile brief — emphasizes out_of_scope pattern}
+
+Recent context (last 10 turns):
+{recent}
+
+Episodic context (similar past struggles):
+{episodic}
+
+Response guidance:
+- Tone: matter-of-fact (not pitying, not too warm)
+- Acknowledge the pattern explicitly
+- This is the 4th time this exact trap has caught them
+- Be specific: cite the past sessions
+- Help them see the structural pattern, not just this question
+
+The question was:
+{question + options + correct}
+
+The student picked: C
+Correct answer: B
+Option C is the OUT_OF_SCOPE trap.
+
+Compose:
+1. Brief, direct: "C is wrong; correct is B"
+2. Explain WHY C is out of scope (cite passage)
+3. Explicitly reference: this is the same trap from Tuesday and Saturday
+4. Offer a teaching framing: what to ask before picking these options
+5. Don't pile on. Be warm, not harsh.
+```
+
+LLM returns:
+```
+B is correct. C is wrong because it goes beyond what the passage 
+supports — the author talks about algorithmic bias, but C jumps to 
+"all algorithms are biased," which is a stronger claim than the 
+passage makes.
+
+Heads up: this is the same out-of-scope trap that caught you on 
+Tuesday's biology passage and Saturday's session. Three or four times 
+now. The pattern: option that *almost* fits, but extends the claim 
+just a notch too far.
+
+Next time you're choosing on inference, try this: ask "is this 
+*exactly* what the passage said, or am I adding a small leap?" 
+The trap options always include that small leap.
+
+Ready for the next one, or want to revisit this passage?
+```
+
+### Step 13: Return AgentResponse
+
+memory_deltas:
+- new_assistant_turn
+- active_context_updates: questions_answered[q-uuid-42] = {selected: 'C', correct: false}
+- attempt_record: insert attempt row with this data
+
+observer_events:
+- { event_type: "wrong_answer", payload: {trap: "out_of_scope", consecutive_wrong: 1} }
+
+### Step 14: Orchestrator commits, returns
+
+### Step 15: Async observer
+
+mentor_agent.inline_observe sees:
+- wrong_answer + out_of_scope trap
+- Check student_skill_profile.trap_counts: out_of_scope = 7 (now 8 with this attempt)
+- This is the 4th time same trap recently
+- Add note (or reinforce existing):
+  - profile_service.add_note({
+      content: "Continues to fall for out-of-scope traps on comparative/contrastive passages. 8 total occurrences.",
+      category: "pattern",
+      confidence: 0.95,
+      source: "observed_behavior"
+    })
+- (Note: probably reinforces existing note rather than creating new)
+
+**User experience:**
+- "Whoa, the bot remembered Tuesday and Saturday"
+- Explanation feels personal, not generic
+- The teaching framing ("ask: did the author actually say this?") is actionable
+- This is the moment that makes them feel "this bot knows me"
+
+This is the **target conversational quality** for v5.
+
+---
+
+## Trace 5: Off-Topic Query (Guardrails)
+
+### Scenario
+
+Archit, frustrated with prep, asks: "actually can you help me write an email to my boss about taking time off"
+
+This is out of scope. Should soft-redirect.
+
+---
+
+### Steps 1-5: Standard until planner
+
+### Step 6: Planner classifies
+
+```json
+{
+  "intent": {
+    "domain": "out_of_scope",
+    "action": "casual",
+    "continuation": "new_session",
+    "emotional_tone": "stressed",
+    "depth": "full_engagement",
+    "references_past": "none",
+    "specific_focus": null
+  },
+  "context_needs": {
+    "profile": "skip",
+    "episodic": { "needed": false },
+    "specific_messages": { "needed": false }
+  },
+  "response_guidance": {
+    "tone": "warm",
+    "should_acknowledge_feeling": true,
+    "should_reference_pattern": false,
+    "session_action": "continue"
+  }
+}
+```
+
+Note: planner detected stress in tone even though domain is out-of-scope. Good signal.
+
+### Step 7: Guardrail trigger
+
+domain == 'out_of_scope' → orchestrator handles directly, doesn't invoke agent.
+
+Compose soft-redirect response. Logic:
+- If emotional_tone is high/stressed/frustrated, acknowledge it briefly first
+- Always note dhri's scope
+- Always offer a path forward in scope
+
+```python
+if intent.emotional_tone in ['stressed', 'low', 'frustrated']:
+    response = "I hear you — sounds like a lot going on. " + scope_note + path_forward
+else:
+    response = scope_note + path_forward
+
+scope_note = "I'm focused on CAT VARC right now, so I can't help with the email. "
+path_forward = "If a quick break would help, want to do 5 minutes of practice 
+                to reset your head, or chat about how prep is going?"
+```
+
+Final response:
+```
+I hear you — sounds like a lot going on right now.
+
+I'm focused on CAT VARC right now, so I can't help with the email itself. 
+But if a quick break would help reset your head, want to do 5 minutes of 
+practice, or chat about how prep is going?
+```
+
+Buttons: `[5 quick questions]` `[Talk about prep]` `[Just leave it]`
+
+### Step 8: Persist response, observer event
+
+- Insert assistant message
+- Insert observer event: `{ event_type: 'out_of_scope_query', payload: {original_message: '...', emotional_tone: 'stressed'} }`
+- This event gets processed by mentor inline observer:
+  - Stress signal detected → may add note: "Mentioned work stress around taking time off"
+
+### Step 9: Skip agent invocation, skip retrieval
+
+Save tokens and time. Total elapsed: ~2.5s (just planner + simple compose).
+
+### Step 10: Return to bus
+
+**User experience:**
+- Bot didn't lecture or moralize
+- Acknowledged the stress
+- Made the boundary clear
+- Offered helpful alternatives
+- Didn't break the relationship
+
+Important: the bot still captured the emotional signal in the profile, so future sessions can reference it.
+
+---
+
+## Shorter Traces
+
+### Repeat-Question Fallback
+
+When student has done all 48 questions:
+- Tier 1-4 fail (no unseen)
+- Tier 5: stale repeat (not in last 7 days) succeeds
+- VARC agent says: "Running low on fresh inference questions — let's revisit one from 12 days ago. Your thinking might've evolved."
+- Serves question, tracks attempt
+- Includes `fallback_tier: 5` in metadata for analytics
+
+If even tier 6 fails (zero questions in DB matching anything):
+- Agent: "I'm out of fresh material on this topic. Want to switch to {other subskill} instead?"
+
+### Returning After Long Break
+
+Student opens dhri after 5 days away.
+
+- New session created
+- Planner detects: gap > 2 hours, no current_focus
+- profile + episodic loaded
+- Mentor agent (or VARC with response_guidance.tone='warm') opens with:
+  ```
+  Welcome back. It's been about 5 days — totally fine, life happens.
+  
+  Quick recap of where we were: you were working on inference, 
+  weakest area, dealing with out-of-scope traps. Want to pick that 
+  back up, or start somewhere fresh?
+  ```
+
+The recall is what makes this feel different from generic chatbots.
+
+### Rate Limit Hit
+
+Student sends 80% of limit messages today.
+
+- INCR detects 80% threshold
+- Orchestrator sends warning: "Heads up — you've used 80% of today's quota. {remaining} messages left."
+- Continues to handle the message normally
+
+When 100% hit:
+- INCR detects threshold
+- Orchestrator sends: "You've hit today's limit (heavy testing day!). Come back tomorrow."
+- Persists this assistant message but does NOT invoke agent or LLM
+- Releases lock
+
+### Session-End Pipeline (background)
+
+Cron runs every 10 min. Finds session sess-new-1 with last_activity_at 47 minutes ago.
+
+1. Mark ended: ended_at = now(), end_reason = 'inactivity_timeout'
+2. Load all messages for session: 14 messages (7 user, 7 assistant)
+3. Build prompt:
+   ```
+   Summarize this session AND extract new profile notes.
+   {profile_brief}
+   {top_10_existing_notes}
+   {transcript}
+   Return JSON: { summary_text, themes, key_moments, performance_summary, new_notes, reinforced_note_ids, contradicted_notes }
+   ```
+4. Call MODEL_SUMMARIZER (Gemini Flash)
+5. Returns:
+   ```json
+   {
+     "summary_text": "Archit completed 3 inference questions on AI ethics, scoring 2/3. Hit out-of-scope trap once again — same pattern from Tuesday/Saturday. Asked a metacognitive question about what 'inference' means in CAT context, suggesting he's reaching for understanding, not just reps. Energy good. 18-minute session.",
+     "themes": ["inference", "out_of_scope_traps", "metacognition", "ai_ethics"],
+     "key_moments": {
+       "metacognitive_moments": [{"turn": 5, "content": "asked what 'inferred' means in CAT context"}],
+       "struggles": [{"question_id": "q-uuid-42", "trap": "out_of_scope"}]
+     },
+     "performance_summary": {"questions": 3, "correct": 2, "accuracy": 0.67},
+     "new_notes": [],
+     "reinforced_note_ids": ["note-uuid-pattern-1"],
+     "contradicted_notes": []
+   }
+   ```
+6. Insert episodic_summary
+7. Reinforce existing pattern note
+8. Clear active session in Redis (already cleared by orchestrator on inactivity)
+
+User wasn't online. Cost: ~$0.005. Pipeline runs in background, ~3-4 seconds.
+
+---
+
+## Validation Checklist (Per Trace)
+
+After each implementation slice, verify these traces work:
+
+### Onboarding (Trace 1):
+- [ ] /start creates student row
+- [ ] FSM advances correctly through all steps
+- [ ] Diagnostic test serves 5 questions in order
+- [ ] Mentor synthesis runs after Q5
+- [ ] onboarding_complete = true at end
+- [ ] Total time ~5-7 minutes
+
+### Normal practice (Trace 2):
+- [ ] Returning user gets contextual greeting
+- [ ] Profile injected into responses
+- [ ] Past sessions referenced when relevant
+- [ ] Question retrieval honors profile signals
+- [ ] Response time ~4-5 seconds
+
+### Mid-session doubt (Trace 3):
+- [ ] Concept question detected (not as topic switch)
+- [ ] Minimal context loaded (saves tokens)
+- [ ] Active session preserved
+- [ ] User can resume practice cleanly
+
+### Wrong answer with pattern recall (Trace 4):
+- [ ] Past sessions explicitly referenced in explanation
+- [ ] Trap pattern called out
+- [ ] Profile note reinforced/created
+- [ ] Tone is matter-of-fact, not patronizing
+
+### Off-topic guardrail (Trace 5):
+- [ ] Out-of-scope detected by planner
+- [ ] Soft-redirect response (not harsh refusal)
+- [ ] Emotional tone acknowledged if present
+- [ ] No agent invocation (saves tokens)
+- [ ] Observer event captured for profile
+
+### Session-end pipeline:
+- [ ] Cron triggers on inactivity
+- [ ] Combined summary + extraction LLM call
+- [ ] Episodic summary inserted
+- [ ] Notes added/reinforced/superseded
+- [ ] Active session cleared
+
+---
+
+## What Could Go Wrong (Failure Modes by Step)
+
+For implementation: build error handling for each.
+
+| Step | Failure mode | Mitigation |
+|------|--------------|------------|
+| Lock acquisition | Lock held | Return "still working on last message" |
+| Persist user message | DB write fails | Fail loud, don't continue |
+| Rate limit check | Redis down | Allow request through, log alert |
+| Onboarding FSM | Invalid state | Reset to last known good step |
+| Planner LLM | Times out / malformed | Default classification, full context |
+| Planner LLM | Returns invalid domain | Treat as 'varc' |
+| Profile fetch | DB error | Use empty brief, log |
+| Episodic fetch | DB error | Empty list, log |
+| Embedding search | pgvector error | Empty list, log |
+| Agent invocation | Exception | Graceful error response, no memory commit |
+| Question retrieval | All tiers fail | "No fresh material" message |
+| Generation LLM | Times out | "Trying that again" + retry once |
+| Generation LLM | Malformed | Hardcoded fallback message |
+| Persist assistant | DB write fails | Log; user already saw response, but state inconsistent — alert |
+| Memory deltas | Redis down | Log; state may be inconsistent |
+| Bus delivery | Telegram API fails | Retry once; user may not see response |
+
+The principle: **never crash the user-facing flow, even at the cost of some state inconsistency**. Better to send a response and have a state hiccup than to crash.
+
+---
+
+## Summary
+
+These traces represent the conversational quality target for v5. If the implementation produces these flows in 4-5 seconds with the right tone and context awareness, the architecture is working.
+
+The "wow moments" are:
+1. Onboarding feels personal, not formy
+2. Wrong-answer explanations reference specific past mistakes (Trace 4)
+3. Returning after a break, the bot recalls context (handled in load + planner)
+4. Topic switches are smooth (Trace 3)
+5. Off-topic queries get warm, scope-clear redirects (Trace 5)
+
+These five qualities are what make dhri feel like Claude/ChatGPT for VARC — and they emerge from the architecture, not from any single magic prompt.
