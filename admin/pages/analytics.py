@@ -4,7 +4,7 @@ import asyncio
 
 import streamlit as st
 
-from db.client import db, init_db_pool
+from shared.db.client import db, init_db_pool
 
 st.title("Analytics")
 

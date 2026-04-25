@@ -5,7 +5,7 @@ import asyncio
 import streamlit as st
 
 from config import ALL_SUBSKILLS, STUDENT_SKILLS
-from db.client import db, init_db_pool
+from shared.db.client import db, init_db_pool
 
 st.title("Questions")
 

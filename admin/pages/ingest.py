@@ -4,7 +4,7 @@ import asyncio
 
 import streamlit as st
 
-from ingest.pipeline import run_seed_ingest, run_full_ingest
+from scripts.ingest.pipeline import run_seed_ingest, run_full_ingest
 
 st.title("Ingest")
 

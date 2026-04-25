@@ -13,15 +13,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 MODULES = [
-    "config", "db.client", "memory.session", "memory.profile", "memory.summarizer",
-    "agent.llm", "agent.prompts", "agent.explainer",
-    "retrieval.selector", "retrieval.reranker", "retrieval.technique_queries",
-    "ingest.embedder", "ingest.tagger", "ingest.pipeline",
-    "handlers.onboarding", "handlers.home", "handlers.stats",
-    "handlers.practice.common", "handlers.practice.rc",
-    "handlers.practice.pj", "handlers.practice.va",
-    "bot.router", "bot.commands", "bot.callbacks",
-    "bot.free_text", "bot.keyboards", "bot.utils", "main",
+    "config",
+    # shared/ infrastructure
+    "shared.db.client", "shared.redis.client", "shared.llm.openrouter",
+    "shared.telegram.keyboards", "shared.telegram.utils",
+    # v4_legacy/ — kept runnable until v5 services replace each piece
+    "v4_legacy.memory.profile", "v4_legacy.memory.summarizer",
+    "v4_legacy.agent.classifier", "v4_legacy.agent.explainer", "v4_legacy.agent.prompts",
+    "v4_legacy.retrieval.selector", "v4_legacy.retrieval.reranker",
+    "v4_legacy.retrieval.technique_queries",
+    "v4_legacy.handlers.onboarding", "v4_legacy.handlers.home", "v4_legacy.handlers.stats",
+    "v4_legacy.handlers.practice.common", "v4_legacy.handlers.practice.rc",
+    "v4_legacy.handlers.practice.pj", "v4_legacy.handlers.practice.va",
+    "v4_legacy.bot.router", "v4_legacy.bot.commands", "v4_legacy.bot.callbacks",
+    "v4_legacy.bot.free_text",
+    "v4_legacy.db.queries",
+    # scripts/ingest/ — content tagging pipeline
+    "scripts.ingest.embedder", "scripts.ingest.tagger", "scripts.ingest.pipeline",
+    "main",
 ]
 REQUIRED_ENV_VARS = [
     "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET",
@@ -73,7 +82,7 @@ def check_1_imports(r):
 def check_2_taxonomy(r):
     try:
         from config import ALL_SUBSKILLS
-        from retrieval.technique_queries import SUBSKILL_TO_TECHNIQUE_QUERY
+        from v4_legacy.retrieval.technique_queries import SUBSKILL_TO_TECHNIQUE_QUERY
     except Exception as e:
         r.add("FAIL", 2, f"Cannot load taxonomy: {e}"); return
     missing = set(ALL_SUBSKILLS) - set(SUBSKILL_TO_TECHNIQUE_QUERY.keys())
@@ -117,7 +126,7 @@ def check_4_env(r):
 
 
 def check_5_seed(r):
-    seed = PROJECT_ROOT / "data" / "dhri_48_pyqs_v4.json"
+    seed = PROJECT_ROOT / "content" / "pyqs" / "dhri_48_pyqs_v4.json"
     if not seed.exists():
         r.add("FAIL", 5, f"Seed file missing: {seed.relative_to(PROJECT_ROOT)}"); return
     try:
@@ -149,7 +158,7 @@ def check_5_seed(r):
 
 async def check_6_db(r):
     try:
-        from db.client import db, init_db_pool
+        from shared.db.client import db, init_db_pool
     except Exception as e:
         r.add("FAIL", 6, f"Cannot import db client: {e}"); return
     try:
@@ -161,7 +170,7 @@ async def check_6_db(r):
             "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
         )
         if not tables:
-            r.add("WARN", 6, "DB reachable but 0 tables in public schema (run db/schema.sql)."); return
+            r.add("WARN", 6, "DB reachable but 0 tables in public schema (run migrations/v4/initial_schema.sql)."); return
         r.add("PASS", 6, f"DB reachable; {tables} tables in public schema.")
     except Exception as e:
         r.add("FAIL", 6, f"DB failed: {type(e).__name__}: {e}")
@@ -169,7 +178,7 @@ async def check_6_db(r):
 
 async def check_7_redis(r):
     try:
-        from memory.session import init_redis, redis
+        from shared.redis.client import init_redis, redis
     except Exception as e:
         r.add("FAIL", 7, f"Cannot import redis client: {e}"); return
     try:
@@ -186,7 +195,7 @@ async def check_7_redis(r):
 
 async def check_8_embedding(r):
     try:
-        from agent.llm import embed
+        from shared.llm.openrouter import embed
     except Exception as e:
         r.add("FAIL", 8, f"Cannot import embed: {e}"); return
     try:
