@@ -249,6 +249,50 @@ For Sarvam application: DECISIONS.md is one of the strongest portfolio signals b
 
 ---
 
+## 2026-04-25 — v5 tables live in `v5.*` Postgres schema, not `public.*`
+
+**Status:** Decided
+**Slice / Phase:** Slice 1 implementation
+
+**Decision:** All v5 tables live in a dedicated Postgres schema named `v5`. v4 tables continue to live in `public`. v5 services qualify all table names (e.g., `v5.students`, `v5.messages`, `v5.sessions`).
+
+**Why:** v4 already owns `public.sessions` and `public.messages` with different schemas than what v5 needs. Sharing the `public` namespace would either force destructive ALTERs to v4 tables (risking v4 functionality during the build) or create collision risks. A separate schema keeps v5 truly append-only — v4 stays 100% functional throughout the v5 build, supporting the strangler-fig migration discipline.
+
+**Rejected alternatives:**
+- **Rename v5 tables to avoid collision** (e.g., `students` → `student_profiles_v5`): rejected because the names would become ugly, inconsistent with the design docs, and add cognitive overhead. Schema prefixes are cleaner than name suffixes.
+- **Migrate v4 tables in place to v5 shape:** rejected because it forces v4 downtime and breaks the strangler-fig discipline. v4 must keep working until we explicitly retire it post-slice-8.
+- **Drop v4 tables before creating v5 ones:** rejected — losing v4 mid-build means losing the rollback path during weeks 1-3 of testing.
+
+**Tradeoffs accepted:**
+- Every v5 query has to write `v5.<table>` instead of just `<table>`. Acceptable; the schema prefix is a documentation feature, making the version explicit in every query.
+- The `01_data_model.md` design doc refers to tables without a schema prefix. The doc remains conceptually correct; the schema prefix is an implementation detail. Doc was not updated retroactively to keep the conceptual model clean.
+
+**Revisit when:** v4 is fully retired (post-slice-8 quality pass) and `public.*` v4 tables are dropped. At that point, decide whether to keep v5 in its own schema or move it to public. Inertia argues for keeping it in `v5` — moving it would churn every query in the codebase for purely cosmetic gain.
+
+---
+
+## 2026-04-25 — Slice 1 ships with manual webhook switching, not auto-registration
+
+**Status:** Decided
+**Slice / Phase:** Slice 1 implementation
+
+**Decision:** Slice 1 keeps `main.py`'s `startup()` function registering the v4 webhook URL automatically on deploy. The v5 webhook is registered manually via curl after deploy and verification. Auto-registration of v5 will be moved into startup() in slice 2 (or later), once v5 is fully verified as the live route.
+
+**Why:** During slice 1, both routes (v4 and v5) coexist. Auto-registering v5 on deploy would silently take over from v4 the moment Railway redeploys, before we've verified v5 works. Manual webhook switching gives us an explicit, deliberate moment to flip from v4 to v5, with the curl command serving as the implicit "I'm ready" signal.
+
+**Rejected alternatives:**
+- **Auto-register v5 in startup() immediately:** rejected for the silent-takeover reason above.
+- **Delete v4 route entirely in slice 1:** rejected because we want v4 as a rollback target during the v5 build. Killing v4 forecloses safety.
+- **Feature-flag the auto-registration based on env var:** rejected as overkill for an 8-slice build that's converging fast.
+
+**Tradeoffs accepted:**
+- Every Railway redeploy after the manual webhook switch will silently revert to v4 (because startup() still registers v4). Mitigation: re-run the v5 setWebhook curl command after every deploy, until slice 2 moves auto-registration to v5.
+- Easy to forget. If we forget after a deploy, users will hit v4 instead of v5 silently — no error, just stale behavior. Mitigation: update startup() in slice 2's prompt as a stated task.
+
+**Revisit when:** Slice 2 ships. At that point, modify `main.py` startup() to auto-register `/v5/webhook/{secret}` and stop auto-registering v4. Keep v4's route handler in `main.py` for emergency rollback (but no longer auto-registered).
+
+---
+
 <!-- 
 TEMPLATE FOR NEW ENTRIES — copy and fill:
 
