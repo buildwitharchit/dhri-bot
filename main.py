@@ -18,6 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WEBHOOK_PATH = f"/webhook/{settings.WEBHOOK_SECRET}"
+V5_WEBHOOK_PATH = f"/v5/webhook/{settings.WEBHOOK_SECRET}"
 
 app = FastAPI()
 ptb_app: Application | None = None
@@ -66,6 +67,19 @@ async def webhook(request: Request) -> Response:
     data = await request.json()
     update = Update.de_json(data, ptb_app.bot)
     await route_update(update, ptb_app)
+    return Response(status_code=200)
+
+
+@app.post(V5_WEBHOOK_PATH)
+async def v5_webhook(request: Request) -> Response:
+    """Slice-1 v5 entry point. Lives alongside the v4 webhook above; the
+    Telegram-side webhook URL is switched to this path manually after
+    verification."""
+    if ptb_app is None:
+        return Response(status_code=503)
+    data = await request.json()
+    from services.message_bus.main import handle_telegram_update
+    await handle_telegram_update(data, ptb_app.bot)
     return Response(status_code=200)
 
 

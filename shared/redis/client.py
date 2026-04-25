@@ -68,6 +68,17 @@ class _RedisFacade:
         result = await _require_client().set(key, value, ex=ex, nx=True)
         return bool(result)
 
+    # ─── LIST OPS (used by v5 working-memory cache) ────────────────────────
+
+    async def lpush(self, key: str, *values: str) -> int:
+        return await _require_client().lpush(key, *values)
+
+    async def ltrim(self, key: str, start: int, stop: int) -> Any:
+        return await _require_client().ltrim(key, start, stop)
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        return await _require_client().lrange(key, start, stop)
+
 
 redis = _RedisFacade()
 

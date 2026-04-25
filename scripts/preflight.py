@@ -30,6 +30,12 @@ MODULES = [
     "v4_legacy.db.queries",
     # scripts/ingest/ — content tagging pipeline
     "scripts.ingest.embedder", "scripts.ingest.tagger", "scripts.ingest.pipeline",
+    # scripts/ — admin entry points
+    "scripts.run_v5_migrations",
+    # v5 services (slice 1 skeletons)
+    "services.memory.main", "services.profile.main",
+    "services.varc.main", "services.mentor.main",
+    "services.orchestrator.main", "services.message_bus.main",
     "main",
 ]
 REQUIRED_ENV_VARS = [
