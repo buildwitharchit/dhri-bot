@@ -44,12 +44,15 @@ async def startup() -> None:
     ptb_app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
     await ptb_app.initialize()
 
-    webhook_url = f"https://{settings.RAILWAY_PUBLIC_DOMAIN}{WEBHOOK_PATH}"
+    # v5 is now the live entry point. The v4 route handler below is still
+    # mounted for emergency rollback (manual setWebhook back to /webhook/...),
+    # but we no longer auto-register it on deploy.
+    webhook_url = f"https://{settings.RAILWAY_PUBLIC_DOMAIN}{V5_WEBHOOK_PATH}"
     await ptb_app.bot.set_webhook(
         url=webhook_url,
         allowed_updates=["message", "callback_query"],
     )
-    logger.info(f"webhook set: {webhook_url}")
+    logger.info(f"webhook set (v5): {webhook_url}")
 
 
 @app.on_event("shutdown")
