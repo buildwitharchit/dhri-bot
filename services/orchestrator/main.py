@@ -36,6 +36,7 @@ from services.memory.main import (
     get_recent_turns,
     resolve_session,
 )
+from services.orchestrator import planner as planner_module
 from services.profile.main import ensure_profile, get_minimal_brief, get_session_stats
 from services.varc.main import handle as varc_handle
 from services.mentor.main import handle as mentor_handle
@@ -108,37 +109,50 @@ async def handle_message(
         # Pre-fetch most-recent unanswered attempt (scoped to current session per Principle 3).
         last_unanswered = await _fetch_last_unanswered_attempt(student_id, session_id)
 
-        # Step 6.5: deterministic action classification
-        intent, payload = await _classify_action(
-            content, content_type, last_unanswered, session_id,
+        # Step 6.5: deterministic action classification.
+        # Returns None when no deterministic rule matched — then we run the
+        # planner LLM (slice 4) for intent classification.
+        deterministic = await _classify_action_deterministic(
+            content, content_type, last_unanswered,
         )
-
-        # Step 6.7: orchestrator-direct actions (no agent invocation)
-        if intent["domain"] == "orchestrator":
-            response = await _handle_orchestrator_action(
-                intent, payload, student_id, tg_id, session_id,
-            )
+        if deterministic is not None:
+            intent, payload = deterministic
+            context_needs: Optional[dict] = None
+            response_guidance = ""
         else:
-            agent_context = {
-                "student_id": student_id,
-                "tg_id": tg_id,
-                "session_id": session_id,
-                "session_resume_candidate": resume_candidate,
-                "recent_turns": recent_turns,
-                "profile_brief": await get_minimal_brief(student_id),
-                "intent": intent,
-                "current_unanswered_attempt": last_unanswered,
-                "current_message": {
-                    "content": content,
-                    "content_type": content_type,
-                    "message_id": user_msg_id,
-                },
-                **payload,
-            }
-            if intent["domain"] == "varc":
-                response = await varc_handle(agent_context)
-            else:
-                response = await mentor_handle(agent_context)
+            # Step 6: planner LLM call. classify() never raises — on any
+            # failure it returns DEFAULT_INTENT (small_talk).
+            classification = await planner_module.classify(
+                message=content,
+                recent_turns=recent_turns,
+                active_session_summary=_session_summary_text(
+                    session_id, last_unanswered,
+                ),
+                student_id=student_id,
+                session_id=session_id,
+                message_id=user_msg_id,
+            )
+            intent = classification["intent"]
+            payload = {}
+            context_needs = classification["context_needs"]
+            response_guidance = classification["response_guidance"]
+
+        # Step 7 + 6.7: route by intent.
+        response = await _route_intent(
+            intent=intent,
+            payload=payload,
+            response_guidance=response_guidance,
+            context_needs=context_needs,
+            student_id=student_id,
+            tg_id=tg_id,
+            session_id=session_id,
+            resume_candidate=resume_candidate,
+            recent_turns=recent_turns,
+            current_unanswered=last_unanswered,
+            content=content,
+            content_type=content_type,
+            user_msg_id=user_msg_id,
+        )
 
         # Step 11.5: keyboard close hint (Fix 3 / Principle 2). When a session
         # boundary just happened, prefer the prior session's last_question_message_id
@@ -242,15 +256,18 @@ async def _check_telegram_retry(tg_update_id: int) -> Optional[dict]:
     }
 
 
-# ─── Step 6.5: deterministic action classification ─────────────────────────
+# ─── Step 6.5: deterministic action classification (no LLM) ────────────────
+#
+# Runs FIRST. If matched, the planner is never invoked — button taps and
+# answer regexes are 100%-confidence signals that don't need LLM inference.
+# Returns None when no rule matched, signalling the caller to run the planner.
 
 
-async def _classify_action(
+async def _classify_action_deterministic(
     content: str,
     content_type: str,
     last_unanswered: Optional[dict],
-    session_id: str,  # noqa: ARG001  reserved for slice 4 planner
-) -> tuple[dict, dict]:
+) -> Optional[tuple[dict, dict]]:
     if content_type == "button":
         if content.startswith("v5_skip_"):
             attempt_id = content[len("v5_skip_"):]
@@ -268,7 +285,6 @@ async def _classify_action(
             tail = content[len("v5_resume_"):]
             if tail == "chat":
                 return _intent("orchestrator", "resume_chat"), {}
-            # v5_resume_<question_id>
             return _intent("varc", "resume_question"), {"resume_question_id": tail}
 
         elif content.startswith("v5_continue_"):
@@ -283,6 +299,12 @@ async def _classify_action(
                 return _intent("varc", "subskill_switch"), {}
             if sub == "done":
                 return _intent("orchestrator", "session_end"), {}
+
+        elif content == "v5_strategy_chat":
+            # New in slice 4: paired with the out_of_scope soft-redirect's
+            # [Strategy chat] button. Open-ended prompt; user's next free-text
+            # turn flows through the planner like any other text input.
+            return _intent("orchestrator", "strategy_chat"), {}
 
         elif content == "v5_retry":
             return _intent("orchestrator", "retry_last"), {}
@@ -305,22 +327,46 @@ async def _classify_action(
                 }
             }
         if last_unanswered is not None and detected is None:
+            # Mid-question doubt: deterministic override per spec, even with
+            # planner active. Stops planner from misclassifying the doubt as
+            # a fresh practice_request.
             return _intent("varc", "doubt_about_current"), {
                 "current_unanswered_attempt": last_unanswered,
             }
 
-    return _intent("varc", "practice_request"), {}
+    return None
 
 
 def _intent(domain: str, action: str) -> dict:
+    """Deterministic-side intent shape. Compatible with planner's IntentClassification
+    so downstream code can read `.subskill` / `.difficulty` / `.secondary_signal`
+    uniformly via `.get(...)` regardless of source."""
     return {
         "domain": domain,
         "action": action,
+        "subskill": None,
+        "difficulty": None,
+        "emotional_tone": "neutral",
+        "secondary_signal": None,
+        "confidence": 1.0,
         "continuation": (
             "new_session" if action == "practice_request" else "continues_current_session"
         ),
-        "emotional_tone": "neutral",
     }
+
+
+def _session_summary_text(
+    session_id: Optional[str], last_unanswered: Optional[dict],
+) -> str:
+    """Compact one-line session description for the planner prompt."""
+    parts: list[str] = []
+    if session_id:
+        parts.append(f"session {session_id[:8]}")
+    if last_unanswered is not None:
+        parts.append(
+            f"unanswered question in flight (attempt {last_unanswered['id'][:8]})"
+        )
+    return ", ".join(parts) if parts else "no active context"
 
 
 def _detect_text_answer(content: str) -> Optional[str]:
@@ -342,6 +388,70 @@ def _extract_answer_letter_from_callback(content: str) -> Optional[str]:
     return tail if tail in {"A", "B", "C", "D"} else None
 
 
+# ─── Step 7 / 6.7: routing dispatcher ───────────────────────────────────────
+#
+# Single entry point for "given an intent (deterministic or planner-derived),
+# produce a response". Orchestrator-direct actions skip agent invocation;
+# domain=varc/mentor invokes the agent.
+
+
+async def _route_intent(
+    *,
+    intent: dict,
+    payload: dict,
+    response_guidance: str,
+    context_needs: Optional[dict],
+    student_id: str,
+    tg_id: int,
+    session_id: str,
+    resume_candidate: Optional[dict],
+    recent_turns: list[dict],
+    current_unanswered: Optional[dict],
+    content: str,
+    content_type: str,
+    user_msg_id: str,
+) -> dict:
+    domain = intent.get("domain")
+    action = intent.get("action")
+
+    # Out-of-scope guardrail — soft-redirect, no agent, no LLM (Step 7).
+    if domain == "out_of_scope" or action == "off_topic":
+        return _build_out_of_scope_response()
+
+    # Orchestrator-direct actions.
+    if domain == "orchestrator":
+        return await _handle_orchestrator_action(
+            intent, payload, student_id, tg_id, session_id,
+        )
+    if action == "small_talk":
+        return _build_small_talk_response()
+    if action == "stats_request":
+        return await _build_stats_response(student_id, session_id)
+
+    # Agent invocation (varc / mentor).
+    agent_context = {
+        "student_id": student_id,
+        "tg_id": tg_id,
+        "session_id": session_id,
+        "session_resume_candidate": resume_candidate,
+        "recent_turns": recent_turns,
+        "profile_brief": await get_minimal_brief(student_id),
+        "intent": intent,
+        "response_guidance": response_guidance,
+        "context_needs": context_needs,
+        "current_unanswered_attempt": current_unanswered,
+        "current_message": {
+            "content": content,
+            "content_type": content_type,
+            "message_id": user_msg_id,
+        },
+        **payload,
+    }
+    if domain == "mentor":
+        return await mentor_handle(agent_context)
+    return await varc_handle(agent_context)
+
+
 # ─── Step 6.7: orchestrator-direct actions ──────────────────────────────────
 
 
@@ -361,6 +471,8 @@ async def _handle_orchestrator_action(
         return await _build_retry_response(student_id, tg_id, session_id)
     if action == "resume_chat":
         return _build_resume_chat_response()
+    if action == "strategy_chat":
+        return _build_strategy_chat_response()
     return _canned("Something's not quite right — let's start fresh.")
 
 
@@ -414,6 +526,74 @@ def _build_resume_chat_response() -> dict:
         "observer_events": [],
         "meta": {"agent": "orchestrator", "response_type": "resume_chat_ack"},
     }
+
+
+def _build_strategy_chat_response() -> dict:
+    return {
+        "content": (
+            "Sure — what would you like to talk through? Could be your prep "
+            "approach, weak areas, time management, or anything else."
+        ),
+        "content_type": "text",
+        "keyboard": None,
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {"agent": "orchestrator", "response_type": "strategy_chat_ack"},
+    }
+
+
+def _build_small_talk_response() -> dict:
+    """Slice 4 / Bug 15: warm acknowledgment + continuation buttons. Never
+    serves a question — that's exactly what makes small_talk safe as the
+    planner's failure default."""
+    return {
+        "content": "Got it. Want to keep going, or take a different angle?",
+        "content_type": "text_with_keyboard",
+        "keyboard": _continuation_keyboard_full(),
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {"agent": "orchestrator", "response_type": "small_talk_ack"},
+    }
+
+
+def _build_out_of_scope_response() -> dict:
+    """Slice 4: soft-redirect for quant/LRDI/general off-topic. No agent
+    invocation, no LLM call — pure templated response with two buttons."""
+    return {
+        "content": (
+            "I'm focused on CAT VARC for now, so I can't help with that. "
+            "Want a VARC question, or want to talk through a strategy concern?"
+        ),
+        "content_type": "text_with_keyboard",
+        "keyboard": _out_of_scope_keyboard(),
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [
+            {"event_type": "out_of_scope_query", "payload": {}},
+        ],
+        "meta": {"agent": "orchestrator", "response_type": "off_topic_redirect"},
+    }
+
+
+def _continuation_keyboard_full() -> dict:
+    """5-button continuation row used by small_talk and other orchestrator
+    responses where all options should be available."""
+    return {"inline_keyboard": [
+        [{"text": "Next question", "callback_data": "v5_continue_next"},
+         {"text": "Different subskill", "callback_data": "v5_continue_subskill"}],
+        [{"text": "Show my stats", "callback_data": "v5_continue_stats"},
+         {"text": "I have a doubt", "callback_data": "v5_continue_doubt"},
+         {"text": "I'm done", "callback_data": "v5_continue_done"}],
+    ]}
+
+
+def _out_of_scope_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "VARC question", "callback_data": "v5_continue_next"},
+         {"text": "Strategy chat", "callback_data": "v5_strategy_chat"}],
+    ]}
 
 
 async def _build_retry_response(student_id: str, tg_id: int, session_id: str) -> dict:

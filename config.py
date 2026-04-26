@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     MODEL_VARC_TUTOR: str = "anthropic/claude-haiku-4-5"   # answer/skip explanations
     MODEL_VARC_RESUME: str = "anthropic/claude-sonnet-4-5"  # returning-after-break warmth
 
+    # Models — v5 services (added in slice 4)
+    MODEL_PLANNER: str = "google/gemini-flash-1.5"         # intent classifier (cheap, fast)
+
     # Spend
     DAILY_LLM_SPEND_CAP_USD: float = 0.50
 

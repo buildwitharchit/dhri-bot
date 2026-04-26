@@ -33,10 +33,11 @@ MODULES = [
     "scripts.ingest.embedder", "scripts.ingest.tagger", "scripts.ingest.pipeline",
     # scripts/ — admin entry points
     "scripts.run_v5_migrations",
-    # v5 services (slice 1 skeletons)
+    # v5 services
     "services.memory.main", "services.profile.main",
     "services.varc.main", "services.mentor.main",
-    "services.orchestrator.main", "services.message_bus.main",
+    "services.orchestrator.main", "services.orchestrator.planner",
+    "services.message_bus.main",
     "main",
 ]
 REQUIRED_ENV_VARS = [

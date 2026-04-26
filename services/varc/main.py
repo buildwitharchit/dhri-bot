@@ -9,13 +9,23 @@
 #   - All attempt rows now carry session_id (threaded from orchestrator).
 #   - Every LLM call is logged to v5.llm_calls.
 #
-# Preserved from slice 2.5:
+# Slice 4 changes:
+#   - intent.subskill / intent.difficulty supplied by planner drive retrieval
+#     (DEFAULT_SUBSKILL / DEFAULT_DIFFICULTY only used when planner returns null
+#     or when a deterministic action like v5_continue_next has no skill hint).
+#   - intent.secondary_signal + response_guidance flow into the explanation
+#     LLM prompt for tone calibration (Bug 15).
+#   - "v5fail" free-text test trigger removed — real LLM error handling now
+#     wraps every openrouter call and returns _error_fallback_response on
+#     failure. To exercise the fallback path, break OPENROUTER_API_KEY.
+#
+# Preserved from slice 2.5 + 3:
 #   - 6-tier retrieval ladder
 #   - Skip flow with continuation buttons
 #   - Mid-question doubt + show_current_question + continue_doubt
 #   - Continuation-button discipline (Principle 1)
-#   - "v5fail" free-text test trigger for the LLM error fallback (slice 4
-#     removes this when planner LLM lands and we can break for real).
+#   - LLM-generated explanations + resume prompt
+#   - HTML-escape of LLM and DB content before delivery
 
 import json
 import logging
@@ -40,7 +50,9 @@ TIER6_PREFIX = (
 )
 
 LLM_FALLBACK_TEXT = "Hmm, having trouble thinking right now. Try again in a moment?"
-_FAIL_TEST_TRIGGER = "v5fail"
+# Note: the slice-2.5 "v5fail" test trigger was removed in slice 4. Real LLM
+# error handling now wraps the actual openrouter call in every LLM site,
+# so the fallback path can be tested by breaking OPENROUTER_API_KEY.
 
 _RECENT_TURNS_FOR_PROMPT = 6
 
@@ -51,10 +63,6 @@ _RECENT_TURNS_FOR_PROMPT = 6
 async def handle(context: dict) -> dict:
     """Action dispatcher. context['intent']['action'] selects the handler."""
     action = context["intent"]["action"]
-
-    msg_content = (context.get("current_message") or {}).get("content", "") or ""
-    if action == "practice_request" and msg_content.strip().lower() == _FAIL_TEST_TRIGGER:
-        return _error_fallback_response(context["intent"])
 
     # Returning-after-break: orchestrator attached a candidate iff this is the
     # first message of a new session and there's a recent unanswered question.
@@ -90,10 +98,17 @@ async def handle(context: dict) -> dict:
 async def _handle_practice_request(context: dict, prefix: Optional[str] = None) -> dict:
     student_id = context["student_id"]
     session_id = context.get("session_id")
+    intent = context.get("intent") or {}
+    # Slice 4: planner supplies subskill/difficulty when the student's message
+    # specifies them. Fall back to inference_basic / medium when planner left
+    # them null (or when a deterministic action like v5_continue_next is the
+    # source — in that case the next-question intent has no skill preference).
+    subskill = intent.get("subskill") or DEFAULT_SUBSKILL
+    difficulty = intent.get("difficulty") or DEFAULT_DIFFICULTY
     question, tier = await _retrieve_with_fallback(
         student_id=student_id,
-        subskill=DEFAULT_SUBSKILL,
-        difficulty=DEFAULT_DIFFICULTY,
+        subskill=subskill,
+        difficulty=difficulty,
         profile_signals=None,
     )
     if question is None:
@@ -184,6 +199,8 @@ async def _handle_answer(context: dict) -> dict:
             skipped=False,
             reference_explanation=q["explanation"] or "",
             recent_turns=context.get("recent_turns") or [],
+            response_guidance=context.get("response_guidance") or "",
+            secondary_signal=context["intent"].get("secondary_signal"),
         )
     except Exception:
         logger.exception("varc: explanation LLM failed; serving error fallback")
@@ -250,6 +267,8 @@ async def _handle_skip(context: dict) -> dict:
             skipped=True,
             reference_explanation=q["explanation"] or "",
             recent_turns=context.get("recent_turns") or [],
+            response_guidance=context.get("response_guidance") or "",
+            secondary_signal=context["intent"].get("secondary_signal"),
         )
     except Exception:
         logger.exception("varc: skip-explanation LLM failed; serving error fallback")
@@ -632,6 +651,8 @@ async def _generate_explanation(
     skipped: bool,
     reference_explanation: str,
     recent_turns: list[dict],
+    response_guidance: str = "",
+    secondary_signal: Optional[dict] = None,
 ) -> str:
     options_block = "\n".join(f"{k}) {v}" for k, v in options.items()) or "(no options listed)"
     if skipped:
@@ -641,6 +662,18 @@ async def _generate_explanation(
     else:
         student_state = f"Student picked: {student_choice}  (incorrect — correct answer was {correct_option})"
 
+    # Slice 4: planner-supplied tone / undertone signals append to the prompt.
+    guidance_block = ""
+    if response_guidance:
+        guidance_block = f"\nResponse guidance from planner: {response_guidance}\n"
+    if isinstance(secondary_signal, dict):
+        sig_value = secondary_signal.get("value")
+        if sig_value:
+            guidance_block += (
+                f"Detected emotional undertone: {sig_value}. "
+                f"Soften tone slightly without making it the focus.\n"
+            )
+
     user_prompt = (
         f"Question: {question_text}\n\n"
         f"Options:\n{options_block}\n\n"
@@ -649,7 +682,8 @@ async def _generate_explanation(
         f"Reference (canonical) explanation — use as a guide; rephrase in your own warm voice:\n"
         f"{(reference_explanation or '(no reference explanation provided)').strip()}\n\n"
         f"Recent turns (most recent last):\n"
-        f"{_format_recent_turns_for_prompt(recent_turns)}\n\n"
+        f"{_format_recent_turns_for_prompt(recent_turns)}\n"
+        f"{guidance_block}\n"
         f"Compose your response now."
     )
 
