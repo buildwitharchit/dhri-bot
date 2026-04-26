@@ -18,8 +18,8 @@ import logging
 from typing import Any, Optional
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, TelegramError
 
 from services.orchestrator.main import handle_message
 from shared.redis.client import update_state
@@ -170,11 +170,8 @@ async def _deliver(
     reply_markup = _build_reply_markup(response.get("keyboard"))
 
     try:
-        edited = await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=thinking_message_id,
-            text=text,
-            reply_markup=reply_markup,
+        edited = await _safe_edit_text(
+            bot, chat_id, thinking_message_id, text, reply_markup,
         )
         # editMessageText returns the edited Message object on text edits.
         return getattr(edited, "message_id", thinking_message_id)
@@ -182,13 +179,79 @@ async def _deliver(
         logger.warning("v5 bus: edit failed (%s); falling back to new message", e)
 
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id, text=text, reply_markup=reply_markup,
-        )
+        sent = await _safe_send_text(bot, chat_id, text, reply_markup)
         return sent.message_id
     except TelegramError as e:
         logger.error("v5 bus: send fallback also failed: %s", e)
         return None
+
+
+# ─── Markdown-with-fallback wrappers ────────────────────────────────────────
+#
+# Telegram's "Markdown" (legacy) parser supports `*bold*` / `_italic_` / etc.
+# but rejects unbalanced or escaped characters. LLM-generated content
+# occasionally produces payloads the parser can't handle — when that happens
+# we retry the same call without parse_mode so the user always gets the text
+# (even if the markdown stops bolding correctly that one time).
+
+
+def _is_parse_entities_error(err: BaseException) -> bool:
+    return "can't parse" in str(err).lower()
+
+
+async def _safe_edit_text(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+) -> Any:
+    try:
+        return await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except BadRequest as e:
+        if not _is_parse_entities_error(e):
+            raise
+        logger.warning(
+            "v5 bus: markdown parse failed on edit; retrying as plain text: %s", e,
+        )
+        return await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+
+
+async def _safe_send_text(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+) -> Any:
+    try:
+        return await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except BadRequest as e:
+        if not _is_parse_entities_error(e):
+            raise
+        logger.warning(
+            "v5 bus: markdown parse failed on send; retrying as plain text: %s", e,
+        )
+        return await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
 
 
 # ─── typing refresh ─────────────────────────────────────────────────────────
