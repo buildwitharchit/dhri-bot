@@ -39,6 +39,7 @@ from services.memory.main import (
 from services.profile.main import ensure_profile, get_minimal_brief, get_session_stats
 from services.varc.main import handle as varc_handle
 from services.mentor.main import handle as mentor_handle
+from shared.telegram.utils import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -365,9 +366,16 @@ async def _handle_orchestrator_action(
 
 async def _build_stats_response(student_id: str, session_id: str) -> dict:
     stats = await get_session_stats(student_id, session_id=session_id)
-    subskills = ", ".join(stats["top_subskills"]) if stats["top_subskills"] else "—"
+    # Subskill names like "inference_basic" don't contain HTML-special chars
+    # but we escape on principle — every dynamic value interpolated into a
+    # template that runs through ParseMode.HTML must be escaped.
+    subskills = (
+        escape_html(", ".join(stats["top_subskills"]))
+        if stats["top_subskills"]
+        else "—"
+    )
     lines = [
-        "*This session so far:*",
+        "<b>This session so far:</b>",
         f"• Attempted: {stats['attempted']}, Correct: {stats['correct']}, Skipped: {stats['skipped']}",
         f"• Accuracy: {stats['accuracy_pct']}%",
         f"• Subskills practiced: {subskills}",

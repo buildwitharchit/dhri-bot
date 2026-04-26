@@ -186,13 +186,21 @@ async def _deliver(
         return None
 
 
-# ─── Markdown-with-fallback wrappers ────────────────────────────────────────
+# ─── HTML-with-fallback wrappers ────────────────────────────────────────────
 #
-# Telegram's "Markdown" (legacy) parser supports `*bold*` / `_italic_` / etc.
-# but rejects unbalanced or escaped characters. LLM-generated content
-# occasionally produces payloads the parser can't handle — when that happens
-# we retry the same call without parse_mode so the user always gets the text
-# (even if the markdown stops bolding correctly that one time).
+# Telegram's HTML parser is more permissive than legacy Markdown: only `<`,
+# `>`, `&` need escaping. Underscores and asterisks pass through cleanly,
+# which kills the entire class of "subskill name like inference_basic looks
+# like an italic marker" parse errors that Markdown was hitting.
+#
+# Callers that interpolate dynamic content (LLM output, DB text) MUST
+# html-escape that content before composing the message — see VARC's
+# _format_question and _generate_explanation, and the orchestrator's
+# _build_stats_response (escape_html is from shared/telegram/utils.py).
+#
+# The fallback retry path stays: if Telegram still rejects the payload as
+# unparseable HTML (rare, but possible if a sanitization gap leaks `<` into
+# the text), we re-send without parse_mode so the user still sees the text.
 
 
 def _is_parse_entities_error(err: BaseException) -> bool:
@@ -212,13 +220,13 @@ async def _safe_edit_text(
             message_id=message_id,
             text=text,
             reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
     except BadRequest as e:
         if not _is_parse_entities_error(e):
             raise
         logger.warning(
-            "v5 bus: markdown parse failed on edit; retrying as plain text: %s", e,
+            "v5 bus: html parse failed on edit; retrying as plain text: %s", e,
         )
         return await bot.edit_message_text(
             chat_id=chat_id,
@@ -239,13 +247,13 @@ async def _safe_send_text(
             chat_id=chat_id,
             text=text,
             reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
     except BadRequest as e:
         if not _is_parse_entities_error(e):
             raise
         logger.warning(
-            "v5 bus: markdown parse failed on send; retrying as plain text: %s", e,
+            "v5 bus: html parse failed on send; retrying as plain text: %s", e,
         )
         return await bot.send_message(
             chat_id=chat_id,

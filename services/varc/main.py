@@ -25,6 +25,7 @@ from config import settings
 from shared.db.client import db
 from shared.llm.openrouter import LLMCallResult, chat_with_metadata
 from shared.observability.llm_log import record_llm_call
+from shared.telegram.utils import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -353,7 +354,9 @@ async def _handle_resume_prompt(context: dict) -> dict:
         "Be warm, brief, specific, and slightly informal. "
         "Output ONLY 1-2 sentences total. "
         "Do NOT include any buttons, options, A/B/C/D, or a new question — "
-        "the system appends those."
+        "the system appends those. "
+        "Output plain text only. Do not use markdown formatting (*, _, backticks) "
+        "or HTML tags."
     )
     user = (
         f"It's been about {candidate['days_since_break']} day(s) since the student's "
@@ -371,7 +374,9 @@ async def _handle_resume_prompt(context: dict) -> dict:
             service="varc", purpose="resume_prompt", result=result,
             student_id=student_id, session_id=session_id, message_id=user_msg_id,
         )
-        text = result.content.strip()
+        # LLM output is treated as untrusted input under ParseMode.HTML —
+        # escape any stray <, >, & so the bus's HTML parser can't choke.
+        text = escape_html(result.content.strip())
     except Exception as e:
         logger.exception("varc: resume_prompt LLM failed; falling back to hardcoded")
         await record_llm_call(
@@ -592,8 +597,9 @@ CRITICAL OUTPUT RULES (do not violate):
 1. Produce ONLY: a brief scoring acknowledgement + a clear explanation + at most one "what next" transition sentence.
 2. NEVER include a new question with passage and A/B/C/D options. NEVER. The next question is appended by the system.
 3. Do NOT include inline buttons, lists of options, or any other interactive elements. The system handles continuation buttons.
-4. Be specific and concise. Aim for 3-5 sentences total.
-5. If the recent turns include something relevant (a pattern, a follow-up, a doubt), reference it naturally — but only if it adds value.
+4. Output plain text only. Do not use markdown formatting (*, _, backticks) or HTML tags. Emphasis comes through your word choice, not formatting.
+5. Be specific and concise. Aim for 3-5 sentences total.
+6. If the recent turns include something relevant (a pattern, a follow-up, a doubt), reference it naturally — but only if it adds value.
 
 Tone: warm, specific, slightly informal. Use ✓ for correct."""
 
@@ -661,7 +667,9 @@ async def _generate_explanation(
             session_id=session_id,
             message_id=user_msg_id,
         )
-        return result.content.strip()
+        # ParseMode.HTML on the bus side — escape LLM output so a stray '<'
+        # or '&' doesn't break delivery.
+        return escape_html(result.content.strip())
     except Exception as e:
         await record_llm_call(
             service="varc",
@@ -681,6 +689,9 @@ async def _generate_explanation(
 
 
 async def _format_question(question: dict) -> str:
+    """Compose the rendered question text. All DB-sourced strings are
+    html-escaped because the bus delivers under ParseMode.HTML — a passage
+    containing '<' or '&' would otherwise be rejected by Telegram."""
     options = _parse_options(question["options"])
     parts: list[str] = []
     if question.get("passage_id"):
@@ -689,10 +700,14 @@ async def _format_question(question: dict) -> str:
             question["passage_id"],
         )
         if passage and passage["full_text"]:
-            parts.append(f"Passage:\n\n{passage['full_text']}")
-    parts.append(f"Question: {question['question_text']}")
+            parts.append(f"Passage:\n\n{escape_html(passage['full_text'])}")
+    parts.append(f"Question: {escape_html(question['question_text'])}")
     if options:
-        parts.append("\n".join(f"{k}) {v}" for k, v in options.items()))
+        parts.append(
+            "\n".join(
+                f"{escape_html(str(k))}) {escape_html(v)}" for k, v in options.items()
+            )
+        )
     return "\n\n".join(parts)
 
 
