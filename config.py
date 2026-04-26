@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
-    # Models
+    # Models — v4 legacy (still used by ingest pipeline + v4_legacy services)
     MODEL_CHAT: str = "google/gemini-flash-1.5"
     MODEL_COMPLEX: str = "anthropic/claude-haiku-4-5"
     MODEL_TAGGER_STRUCTURED: str = "google/gemini-flash-1.5"
@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     MODEL_SUMMARIZER: str = "google/gemini-flash-1.5"
     MODEL_VERIFIER: str = "google/gemini-flash-1.5"
     MODEL_EMBEDDING: str = "openai/text-embedding-3-small"
+
+    # Models — v5 services (added in slice 3)
+    MODEL_VARC_TUTOR: str = "anthropic/claude-haiku-4-5"   # answer/skip explanations
+    MODEL_VARC_RESUME: str = "anthropic/claude-sonnet-4-5"  # returning-after-break warmth
 
     # Spend
     DAILY_LLM_SPEND_CAP_USD: float = 0.50

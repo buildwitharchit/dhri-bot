@@ -53,23 +53,37 @@ _SESSION_FALLBACK_WINDOW = "60 minutes"
 
 
 async def get_session_stats(student_id: str, session_id: Optional[str] = None) -> dict:
-    """Return aggregate stats for the student's current session.
+    """Return aggregate stats for a session.
 
-    Slice 2.5 contract: rolls up rows from v5.student_question_attempts in the
-    last 60 min. When slice 3 wires session_id through, the time-window
-    fallback is replaced with `WHERE session_id = $2::uuid`.
+    Slice 3: when session_id is supplied (the normal case once orchestrator
+    threads it through), filter by session_id directly. Falls back to a
+    last-60-minutes window only when session_id is missing — kept so any
+    legacy slice-2.5 attempt without session_id can still be queried.
     """
-    rows = await db.fetch(
-        f"""
-        SELECT a.is_correct, a.skipped, a.served_at, a.answered_at, q.subskill
-        FROM v5.student_question_attempts a
-        LEFT JOIN public.questions q ON q.question_id = a.question_id
-        WHERE a.student_id = $1::uuid
-          AND a.served_at > now() - interval '{_SESSION_FALLBACK_WINDOW}'
-        ORDER BY a.served_at ASC
-        """,
-        student_id,
-    )
+    if session_id is not None:
+        rows = await db.fetch(
+            """
+            SELECT a.is_correct, a.skipped, a.served_at, a.answered_at, q.subskill
+            FROM v5.student_question_attempts a
+            LEFT JOIN public.questions q ON q.question_id = a.question_id
+            WHERE a.student_id = $1::uuid
+              AND a.session_id = $2::uuid
+            ORDER BY a.served_at ASC
+            """,
+            student_id, session_id,
+        )
+    else:
+        rows = await db.fetch(
+            f"""
+            SELECT a.is_correct, a.skipped, a.served_at, a.answered_at, q.subskill
+            FROM v5.student_question_attempts a
+            LEFT JOIN public.questions q ON q.question_id = a.question_id
+            WHERE a.student_id = $1::uuid
+              AND a.served_at > now() - interval '{_SESSION_FALLBACK_WINDOW}'
+            ORDER BY a.served_at ASC
+            """,
+            student_id,
+        )
 
     if not rows:
         return {

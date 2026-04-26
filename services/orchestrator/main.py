@@ -1,24 +1,27 @@
 # services/orchestrator/main.py
 #
-# Slice 2.5 layered on slice 2:
+# Slice 3 layered on slice 2.5:
 #
 #   Step 0   Webhook idempotency check via tg_update_id           (Fix 7)
 #   Step 1   Identity resolution + ensure profile
 #   Step 1.5 Lock acquisition (Redis SETNX)
 #   Step 2   Persist user message (try/except — fail loud)         (Fix 6)
-#   Step 6.5 Deterministic action classification:                  (Fixes 1, 2, 4, 5)
+#   Step 5   SESSION RESOLUTION (slice 3): continuation vs boundary,
+#            DEL state on boundary (Principle 3), detect resume candidate.
+#            v5.messages.session_id is now populated.
+#   Step 6.5 Deterministic action classification — now session-scoped:
 #              - skip / show / continuation / retry callbacks
+#              - resume + resume_chat callbacks                    (slice 3)
 #              - free-text answer regex
 #              - free-text mid-question doubt detection
-#              - default → practice_request
-#   Step 6.7 Orchestrator-direct actions (stats / done / retry)    (Fix 4)
+#   Step 6.7 Orchestrator-direct actions (stats / done / retry / resume_chat)
 #   Step 7-10 Build agent context, route to agent
 #   Step 11.5 Attach previous_question_message_id to response meta (Fix 3)
-#   Step 12  Persist assistant message (try/except — fail loud)    (Fix 6)
-#   Step 13  Memory cache deltas (try/except — log + continue)     (Fix 6)
+#   Step 12  Persist assistant message with session_id              (slice 3)
+#   Step 13  Memory cache deltas (try/except — log + continue)
 #
-# Stubbed for later slices: planner LLM (slice 4), session lifecycle (slice 3),
-# real profile injection (slice 5), onboarding (slice 6), observer (slice 8).
+# Stubbed for later slices: planner LLM (slice 4), real mentor (slice 8),
+# session-end LLM pipeline (slice 7), profile cache (slice 5+).
 
 import json
 import logging
@@ -28,7 +31,11 @@ from typing import Any, Optional
 from shared.db.client import db
 from shared.redis.client import acquire_lock, get_state, release_lock
 
-from services.memory.main import append_turn, get_recent_turns
+from services.memory.main import (
+    append_turn,
+    get_recent_turns,
+    resolve_session,
+)
 from services.profile.main import ensure_profile, get_minimal_brief, get_session_stats
 from services.varc.main import handle as varc_handle
 from services.mentor.main import handle as mentor_handle
@@ -71,10 +78,17 @@ async def handle_message(
         return _canned("Still working on your last message — hang on a sec.")
 
     try:
+        # Step 5 (ahead of message persist so we have session_id for the insert):
+        # session lifecycle + returning-after-break detection.
+        session_id, resume_candidate, prior_question_msg_id = await resolve_session(
+            student_id, tg_id,
+        )
+
         # Step 2: persist user message (Fix 6 — fail loud BEFORE response)
         try:
             user_msg_id = await _persist_message(
                 student_id=student_id,
+                session_id=session_id,
                 role="user",
                 content=content,
                 content_type=content_type,
@@ -88,23 +102,27 @@ async def handle_message(
             logger.exception("step2 db failure persisting user message tg_id=%s", tg_id)
             return _canned("Hmm, something went wrong saving your message. Try once more?")
 
-        recent_turns = await get_recent_turns(tg_id, limit=RECENT_TURNS_FOR_CONTEXT)
+        recent_turns = await get_recent_turns(student_id, tg_id, limit=RECENT_TURNS_FOR_CONTEXT)
 
-        # Pre-fetch most-recent unanswered attempt — drives multiple decisions
-        last_unanswered = await _fetch_last_unanswered_attempt(student_id)
+        # Pre-fetch most-recent unanswered attempt (scoped to current session per Principle 3).
+        last_unanswered = await _fetch_last_unanswered_attempt(student_id, session_id)
 
         # Step 6.5: deterministic action classification
-        intent, payload = await _classify_action(content, content_type, last_unanswered)
+        intent, payload = await _classify_action(
+            content, content_type, last_unanswered, session_id,
+        )
 
         # Step 6.7: orchestrator-direct actions (no agent invocation)
         if intent["domain"] == "orchestrator":
             response = await _handle_orchestrator_action(
-                intent, student_id, tg_id, source_metadata,
+                intent, payload, student_id, tg_id, session_id,
             )
         else:
             agent_context = {
                 "student_id": student_id,
                 "tg_id": tg_id,
+                "session_id": session_id,
+                "session_resume_candidate": resume_candidate,
                 "recent_turns": recent_turns,
                 "profile_brief": await get_minimal_brief(student_id),
                 "intent": intent,
@@ -121,18 +139,22 @@ async def handle_message(
             else:
                 response = await mentor_handle(agent_context)
 
-        # Step 11.5: keyboard close hint (Fix 3) — bus reads this to call
-        # editMessageReplyMarkup on the previous question's message.
+        # Step 11.5: keyboard close hint (Fix 3 / Principle 2). When a session
+        # boundary just happened, prefer the prior session's last_question_message_id
+        # so the OLD question's keyboard is closed too.
         if response.get("requires_keyboard_close"):
-            state = await get_state(tg_id) or {}
+            fresh_state = await get_state(tg_id) or {}
             response.setdefault("meta", {})["previous_question_message_id"] = (
-                state.get("last_question_message_id")
+                prior_question_msg_id
+                if prior_question_msg_id is not None
+                else fresh_state.get("last_question_message_id")
             )
 
         # Step 12: persist assistant message (Fix 6 — fail loud)
         try:
             await _persist_message(
                 student_id=student_id,
+                session_id=session_id,
                 role="assistant",
                 content=response["content"],
                 content_type=response.get("content_type", "text"),
@@ -145,7 +167,7 @@ async def handle_message(
             logger.exception("step12 db failure persisting assistant message tg_id=%s", tg_id)
             return _canned("Hmm, something went wrong saving the response. Try once more?")
 
-        # Step 13: memory cache deltas (Fix 6 — log + continue, response already shaped)
+        # Step 13: memory cache deltas (Fix 6 — log + continue)
         try:
             await append_turn(tg_id, {
                 "role": "user", "content": content, "content_type": content_type,
@@ -171,28 +193,22 @@ async def handle_message(
 
 
 async def _check_telegram_retry(tg_update_id: int) -> Optional[dict]:
-    """If we've seen this update_id before, this is a Telegram retry. Return
-    the prior assistant response if it exists, else a brief in-flight notice."""
     duplicate = await db.fetchrow(
         """
         SELECT message_id, student_id, created_at
-        FROM v5.messages
-        WHERE tg_update_id = $1
-        LIMIT 1
+        FROM v5.messages WHERE tg_update_id = $1 LIMIT 1
         """,
         tg_update_id,
     )
     if duplicate is None:
         return None
-
     logger.info("idempotency: telegram retry detected for update_id=%s", tg_update_id)
     paired = await db.fetchrow(
         """
         SELECT content, content_type
         FROM v5.messages
         WHERE student_id = $1 AND role = 'assistant' AND created_at > $2
-        ORDER BY created_at ASC
-        LIMIT 1
+        ORDER BY created_at ASC LIMIT 1
         """,
         duplicate["student_id"], duplicate["created_at"],
     )
@@ -200,7 +216,7 @@ async def _check_telegram_retry(tg_update_id: int) -> Optional[dict]:
         return {
             "content": paired["content"],
             "content_type": paired["content_type"],
-            "keyboard": None,  # keyboard reconstruction deferred (slice 4+)
+            "keyboard": None,
             "requires_keyboard_close": False,
             "memory_deltas": {},
             "observer_events": [],
@@ -232,24 +248,27 @@ async def _classify_action(
     content: str,
     content_type: str,
     last_unanswered: Optional[dict],
+    session_id: str,  # noqa: ARG001  reserved for slice 4 planner
 ) -> tuple[dict, dict]:
-    """Returns (intent_dict, agent_context_payload).
-    payload is merged into agent_context (e.g., last_question_attempt,
-    skipped_attempt, show_attempt)."""
-
     if content_type == "button":
         if content.startswith("v5_skip_"):
             attempt_id = content[len("v5_skip_"):]
             attempt = await _fetch_attempt_by_id(attempt_id)
             if attempt and attempt["answered_at"] is None:
                 return _intent("varc", "skip_request"), {"skipped_attempt": attempt}
-            # Stale skip (already answered) → fall through to default
 
         elif content.startswith("v5_show_question_"):
             attempt_id = content[len("v5_show_question_"):]
             attempt = await _fetch_attempt_by_id(attempt_id)
             if attempt:
                 return _intent("varc", "show_current_question"), {"show_attempt": attempt}
+
+        elif content.startswith("v5_resume_"):
+            tail = content[len("v5_resume_"):]
+            if tail == "chat":
+                return _intent("orchestrator", "resume_chat"), {}
+            # v5_resume_<question_id>
+            return _intent("varc", "resume_question"), {"resume_question_id": tail}
 
         elif content.startswith("v5_continue_"):
             sub = content[len("v5_continue_"):]
@@ -272,28 +291,23 @@ async def _classify_action(
             if detected and last_unanswered is not None:
                 return _intent("varc", "answer_to_question"), {
                     "last_question_attempt": {
-                        "detected_answer": detected,
-                        "attempt_row": last_unanswered,
+                        "detected_answer": detected, "attempt_row": last_unanswered,
                     }
                 }
-            # Stale answer button (e.g., for an already-answered question) → default
 
     if content_type == "text":
         detected = _detect_text_answer(content)
         if detected and last_unanswered is not None:
             return _intent("varc", "answer_to_question"), {
                 "last_question_attempt": {
-                    "detected_answer": detected,
-                    "attempt_row": last_unanswered,
+                    "detected_answer": detected, "attempt_row": last_unanswered,
                 }
             }
-        # Free text + active unanswered + NOT an answer → mid-question doubt
         if last_unanswered is not None and detected is None:
             return _intent("varc", "doubt_about_current"), {
                 "current_unanswered_attempt": last_unanswered,
             }
 
-    # Default: fresh practice request
     return _intent("varc", "practice_request"), {}
 
 
@@ -321,7 +335,6 @@ def _detect_text_answer(content: str) -> Optional[str]:
 
 
 def _extract_answer_letter_from_callback(content: str) -> Optional[str]:
-    # callback_data: v5_answer_<question_id>_<letter>
     if not content.startswith("v5_answer_"):
         return None
     tail = content.rsplit("_", 1)[-1].upper()
@@ -333,22 +346,25 @@ def _extract_answer_letter_from_callback(content: str) -> Optional[str]:
 
 async def _handle_orchestrator_action(
     intent: dict,
+    payload: dict,  # noqa: ARG001  reserved
     student_id: str,
     tg_id: int,
-    source_metadata: dict,  # noqa: ARG001  reserved for future use
+    session_id: str,
 ) -> dict:
     action = intent["action"]
     if action == "stats_request":
-        return await _build_stats_response(student_id)
+        return await _build_stats_response(student_id, session_id)
     if action == "session_end":
         return _build_session_end_response()
     if action == "retry_last":
-        return await _build_retry_response(student_id, tg_id)
+        return await _build_retry_response(student_id, tg_id, session_id)
+    if action == "resume_chat":
+        return _build_resume_chat_response()
     return _canned("Something's not quite right — let's start fresh.")
 
 
-async def _build_stats_response(student_id: str) -> dict:
-    stats = await get_session_stats(student_id, session_id=None)
+async def _build_stats_response(student_id: str, session_id: str) -> dict:
+    stats = await get_session_stats(student_id, session_id=session_id)
     subskills = ", ".join(stats["top_subskills"]) if stats["top_subskills"] else "—"
     lines = [
         "*This session so far:*",
@@ -380,22 +396,29 @@ def _build_session_end_response() -> dict:
     }
 
 
-async def _build_retry_response(student_id: str, tg_id: int) -> dict:
-    """Find the most recent error_fallback assistant message and re-run from
-    its stashed_intent. If nothing is stashed, fall back to a fresh practice
-    request."""
+def _build_resume_chat_response() -> dict:
+    return {
+        "content": "Sure, what's on your mind?",
+        "content_type": "text",
+        "keyboard": None,
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {"agent": "orchestrator", "response_type": "resume_chat_ack"},
+    }
+
+
+async def _build_retry_response(student_id: str, tg_id: int, session_id: str) -> dict:
     row = await db.fetchrow(
         """
-        SELECT metadata
-        FROM v5.messages
+        SELECT metadata FROM v5.messages
         WHERE student_id = $1::uuid AND role = 'assistant'
           AND metadata->>'response_type' = 'error_fallback'
-        ORDER BY created_at DESC
-        LIMIT 1
+        ORDER BY created_at DESC LIMIT 1
         """,
         student_id,
     )
-    metadata: dict = (row["metadata"] if row else {}) or {}
+    metadata: Any = (row["metadata"] if row else {}) or {}
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
@@ -403,23 +426,21 @@ async def _build_retry_response(student_id: str, tg_id: int) -> dict:
             metadata = {}
     stashed: Any = metadata.get("stashed_intent") if metadata else None
 
-    last_unanswered = await _fetch_last_unanswered_attempt(student_id)
+    last_unanswered = await _fetch_last_unanswered_attempt(student_id, session_id)
     base_context = {
         "student_id": student_id,
         "tg_id": tg_id,
+        "session_id": session_id,
         "recent_turns": [],
         "profile_brief": await get_minimal_brief(student_id),
         "current_unanswered_attempt": last_unanswered,
         "current_message": {"content": "", "content_type": "text", "message_id": None},
     }
-    intent_to_run = stashed if isinstance(stashed, dict) else _intent("varc", "practice_request")
-    base_context["intent"] = intent_to_run
+    base_context["intent"] = stashed if isinstance(stashed, dict) else _intent("varc", "practice_request")
     return await varc_handle(base_context)
 
 
 def _continuation_keyboard_for_stats() -> dict:
-    """Same as VARC's continuation row but minus the [Show my stats] button
-    (we just showed stats — no need to offer it again immediately)."""
     return {"inline_keyboard": [
         [{"text": "Next question", "callback_data": "v5_continue_next"},
          {"text": "Different subskill", "callback_data": "v5_continue_subskill"}],
@@ -431,16 +452,21 @@ def _continuation_keyboard_for_stats() -> dict:
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 
-async def _fetch_last_unanswered_attempt(student_id: str) -> Optional[dict]:
+async def _fetch_last_unanswered_attempt(
+    student_id: str, session_id: str,
+) -> Optional[dict]:
+    """Slice 3: scoped to the CURRENT session. Old-session unanswered attempts
+    do not bleed into the new session (Principle 3)."""
     row = await db.fetchrow(
         """
         SELECT id, question_id, served_at, answered_at, skipped
         FROM v5.student_question_attempts
-        WHERE student_id = $1::uuid AND answered_at IS NULL
-        ORDER BY served_at DESC
-        LIMIT 1
+        WHERE student_id = $1::uuid
+          AND session_id = $2::uuid
+          AND answered_at IS NULL
+        ORDER BY served_at DESC LIMIT 1
         """,
-        student_id,
+        student_id, session_id,
     )
     if row is None:
         return None
@@ -453,7 +479,7 @@ async def _fetch_attempt_by_id(attempt_id: str) -> Optional[dict]:
     try:
         row = await db.fetchrow(
             """
-            SELECT id, question_id, served_at, answered_at, skipped
+            SELECT id, question_id, session_id, served_at, answered_at, skipped
             FROM v5.student_question_attempts
             WHERE id = $1::uuid
             """,
@@ -465,6 +491,8 @@ async def _fetch_attempt_by_id(attempt_id: str) -> Optional[dict]:
         return None
     out = dict(row)
     out["id"] = str(out["id"])
+    if out.get("session_id") is not None:
+        out["session_id"] = str(out["session_id"])
     return out
 
 
@@ -479,7 +507,6 @@ async def _ensure_student(tg_id: int, display_name: Optional[str]) -> str:
             row["student_id"],
         )
         return str(row["student_id"])
-
     row = await db.fetchrow(
         """
         INSERT INTO v5.students (tg_id, display_name)
@@ -494,6 +521,7 @@ async def _ensure_student(tg_id: int, display_name: Optional[str]) -> str:
 async def _persist_message(
     *,
     student_id: str,
+    session_id: Optional[str],
     role: str,
     content: str,
     content_type: str,
@@ -503,11 +531,11 @@ async def _persist_message(
     row = await db.fetchrow(
         """
         INSERT INTO v5.messages
-          (student_id, role, content, content_type, metadata, tg_update_id)
-        VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6)
+          (student_id, session_id, role, content, content_type, metadata, tg_update_id)
+        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb, $7)
         RETURNING message_id
         """,
-        student_id, role, content, content_type,
+        student_id, session_id, role, content, content_type,
         json.dumps(_clean_metadata(metadata)),
         tg_update_id,
     )

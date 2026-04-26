@@ -1,26 +1,33 @@
 # services/varc/main.py
 #
-# Slice 2.5 changes layered on slice 2:
-#   - Question-serve keyboard now has a [Skip / I don't know] row (Fix 1)
-#   - After answer/skip, response ends with continuation buttons; NO auto-serve
-#     of the next question (Principle 1)
-#   - Mid-question doubt acknowledgement (Fix 2)
-#   - Show-current-question re-render (Fix 2)
-#   - "Continue with a different question" doubt ack (Fix 2)
-#   - LLM error_fallback shape ready, plus a slice-2.5 test trigger ("v5fail")
-#     so Fix 5 is exercisable before slice 4 brings real LLM calls
+# Slice 3 changes layered on slice 2.5:
+#   - LLM-generated explanations for answers and skips (Haiku via
+#     MODEL_VARC_TUTOR), with the system prompt enforcing Principle 1
+#     (no inline new question / no A/B/C/D in the model's output).
+#   - Resume prompt for returning-after-break (Sonnet via MODEL_VARC_RESUME).
+#   - resume_question action that re-serves a specific unanswered question.
+#   - All attempt rows now carry session_id (threaded from orchestrator).
+#   - Every LLM call is logged to v5.llm_calls.
 #
-# Slice 2 retrieval ladder (tiers 1–6) is preserved unchanged.
+# Preserved from slice 2.5:
+#   - 6-tier retrieval ladder
+#   - Skip flow with continuation buttons
+#   - Mid-question doubt + show_current_question + continue_doubt
+#   - Continuation-button discipline (Principle 1)
+#   - "v5fail" free-text test trigger for the LLM error fallback (slice 4
+#     removes this when planner LLM lands and we can break for real).
 
 import json
 import logging
 from typing import Any, Optional
 
+from config import settings
 from shared.db.client import db
+from shared.llm.openrouter import LLMCallResult, chat_with_metadata
+from shared.observability.llm_log import record_llm_call
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded retrieval criteria for slice 2 / 2.5. Slice 4's planner replaces.
 DEFAULT_SUBSKILL = "inference_basic"
 DEFAULT_DIFFICULTY = "medium"
 STALE_REPEAT_DAYS = 7
@@ -32,11 +39,9 @@ TIER6_PREFIX = (
 )
 
 LLM_FALLBACK_TEXT = "Hmm, having trouble thinking right now. Try again in a moment?"
-
-# Test hook: a free-text message of "v5fail" (case-insensitive) makes VARC
-# return the LLM error_fallback shape. Lets Fix 5 be tested in slice 2.5
-# before any real LLM call exists. Removed once slice 4 lands the planner.
 _FAIL_TEST_TRIGGER = "v5fail"
+
+_RECENT_TURNS_FOR_PROMPT = 6
 
 
 # ─── public entry point ─────────────────────────────────────────────────────
@@ -46,10 +51,17 @@ async def handle(context: dict) -> dict:
     """Action dispatcher. context['intent']['action'] selects the handler."""
     action = context["intent"]["action"]
 
-    # Test hook for Fix 5 — only on practice_request to avoid hijacking real flows.
     msg_content = (context.get("current_message") or {}).get("content", "") or ""
     if action == "practice_request" and msg_content.strip().lower() == _FAIL_TEST_TRIGGER:
         return _error_fallback_response(context["intent"])
+
+    # Returning-after-break: orchestrator attached a candidate iff this is the
+    # first message of a new session and there's a recent unanswered question.
+    if (
+        action == "practice_request"
+        and context.get("session_resume_candidate") is not None
+    ):
+        return await _handle_resume_prompt(context)
 
     if action == "answer_to_question":
         return await _handle_answer(context)
@@ -61,6 +73,8 @@ async def handle(context: dict) -> dict:
         return await _handle_show_question(context)
     if action == "continue_doubt":
         return _handle_continue_doubt(context)
+    if action == "resume_question":
+        return await _handle_resume_question(context)
     if action == "subskill_switch":
         return await _handle_practice_request(
             context,
@@ -74,6 +88,7 @@ async def handle(context: dict) -> dict:
 
 async def _handle_practice_request(context: dict, prefix: Optional[str] = None) -> dict:
     student_id = context["student_id"]
+    session_id = context.get("session_id")
     question, tier = await _retrieve_with_fallback(
         student_id=student_id,
         subskill=DEFAULT_SUBSKILL,
@@ -83,7 +98,9 @@ async def _handle_practice_request(context: dict, prefix: Optional[str] = None) 
     if question is None:
         return _terminal_response("I'm out of fresh material right now — please try again later.")
 
-    attempt_id = await _record_attempt(student_id, question["question_id"])
+    attempt_id = await _record_attempt(
+        student_id, question["question_id"], session_id, fallback_tier=tier,
+    )
 
     sections: list[str] = []
     if prefix:
@@ -98,31 +115,81 @@ async def _handle_practice_request(context: dict, prefix: Optional[str] = None) 
     options = _parse_options(question["options"])
     keyboard = _question_keyboard(question["question_id"], options, attempt_id)
 
-    return {
-        "content": content,
-        "content_type": "text_with_keyboard",
-        "keyboard": keyboard,
-        "requires_keyboard_close": True,
-        "track_question_attempt_id": attempt_id,
-        "memory_deltas": {},
-        "observer_events": [],
-        "meta": {
-            "agent": "varc",
-            "response_type": "question_serve",
-            "retrieved_question_id": question["question_id"],
-            "fallback_tier": tier,
-            "subskill": question["subskill"],
-            "difficulty": question["difficulty"],
-            "attempt_id": attempt_id,
-        },
-    }
+    return _question_serve_response(
+        content=content,
+        keyboard=keyboard,
+        attempt_id=attempt_id,
+        question=question,
+        tier=tier,
+    )
 
 
 async def _handle_answer(context: dict) -> dict:
     info = context["last_question_attempt"]
-    explanation_block = await _process_answer(context["student_id"], info)
+    student_id = context["student_id"]
+    session_id = context.get("session_id")
+    user_msg_id = (context.get("current_message") or {}).get("message_id")
+
+    detected = info["detected_answer"]
+    attempt_row = info["attempt_row"]
+    question_id = attempt_row["question_id"]
+    attempt_id = attempt_row["id"]
+
+    q = await db.fetchrow(
+        """
+        SELECT correct_option, explanation, question_text, options, passage_id
+        FROM public.questions WHERE question_id = $1
+        """,
+        question_id,
+    )
+    if q is None or q["correct_option"] is None:
+        await db.execute(
+            """
+            UPDATE v5.student_question_attempts
+            SET answered_at = now(), student_answer = $2, explanation_shown = true
+            WHERE id = $1::uuid
+            """,
+            attempt_id, detected,
+        )
+        return _continuation_response("Couldn't score that answer — let's try a fresh question.")
+
+    correct_option = (q["correct_option"] or "").strip().upper()
+    is_correct = detected == correct_option
+    info["was_correct"] = is_correct
+
+    await db.execute(
+        """
+        UPDATE v5.student_question_attempts
+        SET answered_at = now(),
+            is_correct = $2,
+            student_answer = $3,
+            skipped = false,
+            explanation_shown = true
+        WHERE id = $1::uuid
+        """,
+        attempt_id, is_correct, detected,
+    )
+
+    try:
+        explanation = await _generate_explanation(
+            student_id=student_id,
+            session_id=session_id,
+            user_msg_id=user_msg_id,
+            question_text=q["question_text"],
+            options=_parse_options(q["options"]),
+            correct_option=correct_option,
+            student_choice=detected,
+            is_correct=is_correct,
+            skipped=False,
+            reference_explanation=q["explanation"] or "",
+            recent_turns=context.get("recent_turns") or [],
+        )
+    except Exception:
+        logger.exception("varc: explanation LLM failed; serving error fallback")
+        return _error_fallback_response(context["intent"])
+
     return {
-        "content": explanation_block,
+        "content": explanation,
         "content_type": "text_with_keyboard",
         "keyboard": _continuation_keyboard(),
         "requires_keyboard_close": False,
@@ -131,16 +198,24 @@ async def _handle_answer(context: dict) -> dict:
         "meta": {
             "agent": "varc",
             "response_type": "answer_explanation",
-            "scored_question_id": info["attempt_row"]["question_id"],
-            "was_correct": info.get("was_correct"),
+            "scored_question_id": question_id,
+            "was_correct": is_correct,
+            "model_used": settings.MODEL_VARC_TUTOR,
         },
     }
 
 
 async def _handle_skip(context: dict) -> dict:
     attempt = context["skipped_attempt"]
+    student_id = context["student_id"]
+    session_id = context.get("session_id")
+    user_msg_id = (context.get("current_message") or {}).get("message_id")
+
     q = await db.fetchrow(
-        "SELECT correct_option, explanation FROM public.questions WHERE question_id = $1",
+        """
+        SELECT correct_option, explanation, question_text, options
+        FROM public.questions WHERE question_id = $1
+        """,
         attempt["question_id"],
     )
     await db.execute(
@@ -157,15 +232,30 @@ async def _handle_skip(context: dict) -> dict:
     )
 
     if q is None or q["correct_option"] is None:
-        head = "Skipped — couldn't fetch the answer for this one."
-        explanation_text = ""
-    else:
-        head = f"Skipped — the answer was {q['correct_option']}."
-        explanation_text = (q["explanation"] or "").strip()
-    content = f"{head}\n\n{explanation_text}" if explanation_text else head
+        return _continuation_response("Skipped — couldn't fetch the answer for this one.")
+
+    correct_option = (q["correct_option"] or "").strip().upper()
+
+    try:
+        explanation = await _generate_explanation(
+            student_id=student_id,
+            session_id=session_id,
+            user_msg_id=user_msg_id,
+            question_text=q["question_text"],
+            options=_parse_options(q["options"]),
+            correct_option=correct_option,
+            student_choice=None,
+            is_correct=None,
+            skipped=True,
+            reference_explanation=q["explanation"] or "",
+            recent_turns=context.get("recent_turns") or [],
+        )
+    except Exception:
+        logger.exception("varc: skip-explanation LLM failed; serving error fallback")
+        return _error_fallback_response(context["intent"])
 
     return {
-        "content": content,
+        "content": explanation,
         "content_type": "text_with_keyboard",
         "keyboard": _continuation_keyboard(),
         "requires_keyboard_close": False,
@@ -175,6 +265,7 @@ async def _handle_skip(context: dict) -> dict:
             "agent": "varc",
             "response_type": "skip_explanation",
             "skipped_question_id": attempt["question_id"],
+            "model_used": settings.MODEL_VARC_TUTOR,
         },
     }
 
@@ -214,38 +305,20 @@ async def _handle_show_question(context: dict) -> dict:
     )
     if q is None:
         return _terminal_response("Couldn't find that question — let's try something else.")
-
     qd = dict(q)
     options = _parse_options(qd["options"])
-    content = await _format_question(qd)
     keyboard = _question_keyboard(qd["question_id"], options, attempt["id"])
-
-    return {
-        "content": content,
-        "content_type": "text_with_keyboard",
-        "keyboard": keyboard,
-        # Re-rendering closes any prior copy of this same question (Principle 2).
-        "requires_keyboard_close": True,
-        "track_question_attempt_id": str(attempt["id"]),
-        "memory_deltas": {},
-        "observer_events": [],
-        "meta": {
-            "agent": "varc",
-            "response_type": "question_serve",
-            "retrieved_question_id": qd["question_id"],
-            "fallback_tier": 0,  # re-render, not a fresh tier walk
-            "subskill": qd["subskill"],
-            "difficulty": qd["difficulty"],
-            "attempt_id": str(attempt["id"]),
-            "rerender": True,
-        },
-    }
+    return _question_serve_response(
+        content=await _format_question(qd),
+        keyboard=keyboard,
+        attempt_id=str(attempt["id"]),
+        question=qd,
+        tier=0,
+        rerender=True,
+    )
 
 
 def _handle_continue_doubt(context: dict) -> dict:
-    """The 'I have a different question' / continuation-row 'I have a doubt' tap.
-    Offers a single [Back to current question] button if there's still an
-    unanswered attempt; otherwise just the prompt with no keyboard."""
     attempt = context.get("current_unanswered_attempt")
     keyboard_rows: list[list[dict]] = []
     if attempt:
@@ -264,12 +337,113 @@ def _handle_continue_doubt(context: dict) -> dict:
     }
 
 
-# ─── error fallback (Fix 5) ─────────────────────────────────────────────────
+# ─── Slice 3: returning-after-break ────────────────────────────────────────
+
+
+async def _handle_resume_prompt(context: dict) -> dict:
+    """First message of a new session, with a recent unanswered question
+    available. LLM (Sonnet) composes a warm welcome; buttons are deterministic."""
+    student_id = context["student_id"]
+    session_id = context.get("session_id")
+    user_msg_id = (context.get("current_message") or {}).get("message_id")
+    candidate = context["session_resume_candidate"]
+
+    system = (
+        "You are DHRI welcoming a student back to CAT VARC practice after a break. "
+        "Be warm, brief, specific, and slightly informal. "
+        "Output ONLY 1-2 sentences total. "
+        "Do NOT include any buttons, options, A/B/C/D, or a new question — "
+        "the system appends those."
+    )
+    user = (
+        f"It's been about {candidate['days_since_break']} day(s) since the student's "
+        f"last session. The last question they didn't finish was on the subskill "
+        f"'{candidate['subskill']}'. Brief topic: \"{candidate['brief_topic']}\".\n\n"
+        f"Compose a warm welcome that asks if they want to resume that question or "
+        f"start fresh."
+    )
+
+    try:
+        result = await chat_with_metadata(
+            system=system, user=user, model=settings.MODEL_VARC_RESUME,
+        )
+        await record_llm_call(
+            service="varc", purpose="resume_prompt", result=result,
+            student_id=student_id, session_id=session_id, message_id=user_msg_id,
+        )
+        text = result.content.strip()
+    except Exception as e:
+        logger.exception("varc: resume_prompt LLM failed; falling back to hardcoded")
+        await record_llm_call(
+            service="varc", purpose="resume_prompt", result=None,
+            success=False, error_message=str(e)[:500],
+            fallback_model=settings.MODEL_VARC_RESUME,
+            student_id=student_id, session_id=session_id, message_id=user_msg_id,
+        )
+        text = (
+            f"Welcome back. Last time we were on a {candidate['subskill']} question — "
+            f"want to pick that one up, or start fresh?"
+        )
+
+    return {
+        "content": text,
+        "content_type": "text_with_keyboard",
+        "keyboard": {"inline_keyboard": [
+            [{"text": "Resume that question",
+              "callback_data": f"v5_resume_{candidate['last_question_id']}"},
+             {"text": "Start fresh",
+              "callback_data": "v5_continue_next"}],
+            [{"text": "Just chat first", "callback_data": "v5_resume_chat"}],
+        ]},
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {
+            "agent": "varc",
+            "response_type": "session_resume_prompt",
+            "resume_question_id": candidate["last_question_id"],
+            "resume_subskill": candidate["subskill"],
+            "days_since_break": candidate["days_since_break"],
+            "model_used": settings.MODEL_VARC_RESUME,
+        },
+    }
+
+
+async def _handle_resume_question(context: dict) -> dict:
+    """User tapped [Resume that question]. Re-serve that specific question
+    in the new session as a tier-1 retrieval."""
+    student_id = context["student_id"]
+    session_id = context.get("session_id")
+    question_id = context["resume_question_id"]
+
+    q = await db.fetchrow(
+        f"SELECT {_QUESTION_COLUMNS} FROM public.questions WHERE question_id = $1",
+        question_id,
+    )
+    if q is None:
+        # Resume target gone — fall through to fresh practice.
+        return await _handle_practice_request(context)
+    qd = dict(q)
+    # Tier 1: re-serving a specific known question is the strongest match.
+    attempt_id = await _record_attempt(
+        student_id, qd["question_id"], session_id, fallback_tier=1,
+    )
+    options = _parse_options(qd["options"])
+    keyboard = _question_keyboard(qd["question_id"], options, attempt_id)
+    return _question_serve_response(
+        content=await _format_question(qd),
+        keyboard=keyboard,
+        attempt_id=attempt_id,
+        question=qd,
+        tier=1,
+        is_resume=True,
+    )
+
+
+# ─── error fallback (slice 2.5 carry-over) ─────────────────────────────────
 
 
 def _error_fallback_response(original_intent: dict) -> dict:
-    """Wraps the LLM-failure recovery shape. Stashes the original intent in
-    metadata so v5_retry can re-run the request from where it failed."""
     return {
         "content": LLM_FALLBACK_TEXT,
         "content_type": "text_with_keyboard",
@@ -292,38 +466,25 @@ def _error_fallback_response(original_intent: dict) -> dict:
     }
 
 
-# ─── 6-tier retrieval ladder (preserved from slice 2) ──────────────────────
+# ─── 6-tier retrieval ladder (preserved) ───────────────────────────────────
 
 
 async def _retrieve_with_fallback(
-    *,
-    student_id: str,
-    subskill: str,
-    difficulty: str,
-    profile_signals: Optional[dict],
+    *, student_id: str, subskill: str, difficulty: str, profile_signals: Optional[dict],
 ) -> tuple[Optional[dict], int]:
     if profile_signals:
-        q = await _query_unseen(
-            student_id, subskill=subskill, difficulty=difficulty,
-            profile_signals=profile_signals,
-        )
-        if q:
-            return q, 1
+        q = await _query_unseen(student_id, subskill=subskill, difficulty=difficulty, profile_signals=profile_signals)
+        if q: return q, 1
     q = await _query_unseen(student_id, subskill=subskill, difficulty=difficulty)
-    if q:
-        return q, 2
+    if q: return q, 2
     q = await _query_unseen(student_id, subskill=subskill)
-    if q:
-        return q, 3
+    if q: return q, 3
     q = await _query_unseen(student_id)
-    if q:
-        return q, 4
+    if q: return q, 4
     q = await _query_stale_seen(student_id, subskill=subskill, days=STALE_REPEAT_DAYS)
-    if q:
-        return q, 5
+    if q: return q, 5
     q = await _query_oldest_seen(student_id)
-    if q:
-        return q, 6
+    if q: return q, 6
     return None, 0
 
 
@@ -337,20 +498,16 @@ _BASE_FILTERS = (
 
 
 async def _query_unseen(
-    student_id: str,
-    *,
-    subskill: Optional[str] = None,
+    student_id: str, *, subskill: Optional[str] = None,
     difficulty: Optional[str] = None,
-    profile_signals: Optional[dict] = None,  # noqa: ARG001  reserved for slice 5
+    profile_signals: Optional[dict] = None,  # noqa: ARG001
 ) -> Optional[dict]:
     clauses = [_BASE_FILTERS]
     args: list[Any] = []
     if subskill is not None:
-        args.append(subskill)
-        clauses.append(f"q.subskill = ${len(args)}")
+        args.append(subskill); clauses.append(f"q.subskill = ${len(args)}")
     if difficulty is not None:
-        args.append(difficulty)
-        clauses.append(f"q.difficulty = ${len(args)}")
+        args.append(difficulty); clauses.append(f"q.difficulty = ${len(args)}")
     args.append(student_id)
     sql = f"""
         SELECT {_QUESTION_COLUMNS}
@@ -358,11 +515,9 @@ async def _query_unseen(
         WHERE {' AND '.join(clauses)}
           AND NOT EXISTS (
               SELECT 1 FROM v5.student_question_attempts a
-              WHERE a.student_id = ${len(args)}::uuid
-                AND a.question_id = q.question_id
+              WHERE a.student_id = ${len(args)}::uuid AND a.question_id = q.question_id
           )
-        ORDER BY random()
-        LIMIT 1
+        ORDER BY random() LIMIT 1
     """
     row = await db.fetchrow(sql, *args)
     return dict(row) if row else None
@@ -384,8 +539,7 @@ async def _query_stale_seen(student_id: str, *, subskill: str, days: int) -> Opt
                 AND a.question_id = q.question_id
                 AND a.served_at > now() - make_interval(days => $3)
           )
-        ORDER BY random()
-        LIMIT 1
+        ORDER BY random() LIMIT 1
     """
     row = await db.fetchrow(sql, subskill, student_id, days)
     return dict(row) if row else None
@@ -402,8 +556,7 @@ async def _query_oldest_seen(student_id: str) -> Optional[dict]:
             GROUP BY question_id
         ) seen ON seen.question_id = q.question_id
         WHERE {_BASE_FILTERS}
-        ORDER BY seen.last_served ASC
-        LIMIT 1
+        ORDER BY seen.last_served ASC LIMIT 1
     """
     row = await db.fetchrow(sql, student_id)
     return dict(row) if row else None
@@ -412,62 +565,116 @@ async def _query_oldest_seen(student_id: str) -> Optional[dict]:
 # ─── attempt persistence ────────────────────────────────────────────────────
 
 
-async def _record_attempt(student_id: str, question_id: str) -> str:
+async def _record_attempt(
+    student_id: str,
+    question_id: str,
+    session_id: Optional[str],
+    fallback_tier: Optional[int] = None,
+) -> str:
     row = await db.fetchrow(
         """
-        INSERT INTO v5.student_question_attempts (student_id, question_id)
-        VALUES ($1::uuid, $2)
+        INSERT INTO v5.student_question_attempts
+          (student_id, question_id, session_id, fallback_tier)
+        VALUES ($1::uuid, $2, $3::uuid, $4)
         RETURNING id
         """,
-        student_id, question_id,
+        student_id, question_id, session_id, fallback_tier,
     )
     return str(row["id"])
 
 
-async def _process_answer(student_id: str, info: dict) -> str:
-    detected = info["detected_answer"]
-    attempt_row = info["attempt_row"]
-    question_id = attempt_row["question_id"]
-    attempt_id = attempt_row["id"]
+# ─── LLM-generated explanation ──────────────────────────────────────────────
 
-    q = await db.fetchrow(
-        "SELECT correct_option, explanation FROM public.questions WHERE question_id = $1",
-        question_id,
-    )
-    if q is None or q["correct_option"] is None:
-        await db.execute(
-            """
-            UPDATE v5.student_question_attempts
-            SET answered_at = now(), student_answer = $2, explanation_shown = true
-            WHERE id = $1::uuid
-            """,
-            attempt_id, detected,
-        )
-        return "Couldn't score that answer — let's try a fresh question."
 
-    correct_option = (q["correct_option"] or "").strip().upper()
-    is_correct = detected == correct_option
-    info["was_correct"] = is_correct
+_VARC_TUTOR_SYSTEM_PROMPT = """You are DHRI, a warm CAT VARC tutor. The student just answered or skipped a question.
 
-    await db.execute(
-        """
-        UPDATE v5.student_question_attempts
-        SET answered_at = now(),
-            is_correct = $2,
-            student_answer = $3,
-            skipped = false,
-            explanation_shown = true
-        WHERE id = $1::uuid
-        """,
-        attempt_id, is_correct, detected,
-    )
+CRITICAL OUTPUT RULES (do not violate):
+1. Produce ONLY: a brief scoring acknowledgement + a clear explanation + at most one "what next" transition sentence.
+2. NEVER include a new question with passage and A/B/C/D options. NEVER. The next question is appended by the system.
+3. Do NOT include inline buttons, lists of options, or any other interactive elements. The system handles continuation buttons.
+4. Be specific and concise. Aim for 3-5 sentences total.
+5. If the recent turns include something relevant (a pattern, a follow-up, a doubt), reference it naturally — but only if it adds value.
 
-    explanation_text = (q["explanation"] or "").strip()
-    if is_correct:
-        head = f"Correct ✓  ({detected})"
+Tone: warm, specific, slightly informal. Use ✓ for correct."""
+
+
+def _format_recent_turns_for_prompt(turns: list[dict], limit: int = _RECENT_TURNS_FOR_PROMPT) -> str:
+    if not turns:
+        return "(no prior turns)"
+    # `turns` is most-recent-first (LRANGE 0 N). Reverse for chronological order.
+    chrono = list(reversed(turns[:limit]))
+    lines = []
+    for t in chrono:
+        role = (t.get("role") or "?").strip()
+        content = (t.get("content") or "").strip().replace("\n", " ")
+        if len(content) > 240:
+            content = content[:237] + "…"
+        lines.append(f"[{role}]: {content}")
+    return "\n".join(lines)
+
+
+async def _generate_explanation(
+    *,
+    student_id: str,
+    session_id: Optional[str],
+    user_msg_id: Optional[str],
+    question_text: str,
+    options: dict,
+    correct_option: str,
+    student_choice: Optional[str],
+    is_correct: Optional[bool],
+    skipped: bool,
+    reference_explanation: str,
+    recent_turns: list[dict],
+) -> str:
+    options_block = "\n".join(f"{k}) {v}" for k, v in options.items()) or "(no options listed)"
+    if skipped:
+        student_state = "Student skipped this question."
+    elif is_correct:
+        student_state = f"Student picked: {student_choice}  (correct ✓)"
     else:
-        head = f"Not quite — you picked {detected}, the answer was {correct_option}."
-    return f"{head}\n\n{explanation_text}" if explanation_text else head
+        student_state = f"Student picked: {student_choice}  (incorrect — correct answer was {correct_option})"
+
+    user_prompt = (
+        f"Question: {question_text}\n\n"
+        f"Options:\n{options_block}\n\n"
+        f"Correct answer: {correct_option}\n"
+        f"{student_state}\n\n"
+        f"Reference (canonical) explanation — use as a guide; rephrase in your own warm voice:\n"
+        f"{(reference_explanation or '(no reference explanation provided)').strip()}\n\n"
+        f"Recent turns (most recent last):\n"
+        f"{_format_recent_turns_for_prompt(recent_turns)}\n\n"
+        f"Compose your response now."
+    )
+
+    try:
+        result: LLMCallResult = await chat_with_metadata(
+            system=_VARC_TUTOR_SYSTEM_PROMPT,
+            user=user_prompt,
+            model=settings.MODEL_VARC_TUTOR,
+        )
+        await record_llm_call(
+            service="varc",
+            purpose=("skip_explanation" if skipped else "answer_explanation"),
+            result=result,
+            student_id=student_id,
+            session_id=session_id,
+            message_id=user_msg_id,
+        )
+        return result.content.strip()
+    except Exception as e:
+        await record_llm_call(
+            service="varc",
+            purpose=("skip_explanation" if skipped else "answer_explanation"),
+            result=None,
+            success=False,
+            error_message=str(e)[:500],
+            fallback_model=settings.MODEL_VARC_TUTOR,
+            student_id=student_id,
+            session_id=session_id,
+            message_id=user_msg_id,
+        )
+        raise
 
 
 # ─── formatting & keyboards ─────────────────────────────────────────────────
@@ -501,19 +708,13 @@ def _parse_options(raw: Any) -> dict:
 
 
 def _question_keyboard(question_id: str, options: dict, attempt_id: str) -> dict:
-    answer_row = [
-        {"text": k, "callback_data": f"v5_answer_{question_id}_{k}"}
-        for k in options.keys()
-    ]
-    skip_row = [{
-        "text": "Skip / I don't know",
-        "callback_data": f"v5_skip_{attempt_id}",
-    }]
+    answer_row = [{"text": k, "callback_data": f"v5_answer_{question_id}_{k}"}
+                  for k in options.keys()]
+    skip_row = [{"text": "Skip / I don't know", "callback_data": f"v5_skip_{attempt_id}"}]
     return {"inline_keyboard": [answer_row, skip_row]}
 
 
 def _continuation_keyboard() -> dict:
-    """5-button two-row continuation row used after answer / skip / stats."""
     return {"inline_keyboard": [
         [{"text": "Next question", "callback_data": "v5_continue_next"},
          {"text": "Different subskill", "callback_data": "v5_continue_subskill"}],
@@ -532,4 +733,52 @@ def _terminal_response(text: str) -> dict:
         "memory_deltas": {},
         "observer_events": [],
         "meta": {"agent": "varc", "response_type": "terminal"},
+    }
+
+
+def _continuation_response(text: str) -> dict:
+    """Used when scoring fails but we still want to offer continuation buttons."""
+    return {
+        "content": text,
+        "content_type": "text_with_keyboard",
+        "keyboard": _continuation_keyboard(),
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {"agent": "varc", "response_type": "answer_explanation"},
+    }
+
+
+def _question_serve_response(
+    *,
+    content: str,
+    keyboard: dict,
+    attempt_id: str,
+    question: dict,
+    tier: int,
+    rerender: bool = False,
+    is_resume: bool = False,
+) -> dict:
+    meta: dict[str, Any] = {
+        "agent": "varc",
+        "response_type": "question_serve",
+        "retrieved_question_id": question["question_id"],
+        "fallback_tier": tier,
+        "subskill": question["subskill"],
+        "difficulty": question["difficulty"],
+        "attempt_id": attempt_id,
+    }
+    if rerender:
+        meta["rerender"] = True
+    if is_resume:
+        meta["is_resume"] = True
+    return {
+        "content": content,
+        "content_type": "text_with_keyboard",
+        "keyboard": keyboard,
+        "requires_keyboard_close": True,
+        "track_question_attempt_id": attempt_id,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": meta,
     }

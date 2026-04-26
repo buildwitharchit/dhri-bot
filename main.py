@@ -100,6 +100,20 @@ async def cleanup_endpoint(request: Request) -> Response:
     return Response(content=f'{{"closed": {count}}}', media_type="application/json")
 
 
+@app.post("/admin/v5/cleanup-sessions")
+async def v5_cleanup_endpoint(request: Request) -> Response:
+    """Slice 3: closes v5.sessions where last_activity_at > 30 min ago.
+    Wire to a Railway cron at ~10-minute cadence."""
+    if request.headers.get("X-Admin-Secret") != settings.ADMIN_REPORTS_SECRET:
+        return Response(status_code=403)
+    from services.memory.main import cleanup_inactive_sessions
+    count = await cleanup_inactive_sessions()
+    return Response(
+        content=f'{{"closed": {count}}}',
+        media_type="application/json",
+    )
+
+
 @app.post("/admin/send-reports")
 async def reports_endpoint(request: Request) -> Response:
     if request.headers.get("X-Admin-Secret") != settings.ADMIN_REPORTS_SECRET:

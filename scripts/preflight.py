@@ -17,6 +17,7 @@ MODULES = [
     # shared/ infrastructure
     "shared.db.client", "shared.redis.client", "shared.llm.openrouter",
     "shared.telegram.keyboards", "shared.telegram.utils",
+    "shared.observability.llm_log",
     # v4_legacy/ — kept runnable until v5 services replace each piece
     "v4_legacy.memory.profile", "v4_legacy.memory.summarizer",
     "v4_legacy.agent.classifier", "v4_legacy.agent.explainer", "v4_legacy.agent.prompts",

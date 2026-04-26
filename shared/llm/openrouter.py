@@ -5,6 +5,8 @@
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -92,12 +94,29 @@ _MAX_RETRIES = 3
 _BASE_BACKOFF = 1.0
 
 
-async def _chat_completion(model: str, messages: list[dict]) -> str:
+@dataclass
+class LLMCallResult:
+    content: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+    latency_ms: int
+
+
+async def _chat_completion_with_metadata(
+    model: str, messages: list[dict]
+) -> LLMCallResult:
+    """Core chat completion. Returns content + token/cost/latency metadata.
+    Spend tracking still happens here (so it stays consistent across both
+    public wrappers below)."""
     est_tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages) + 400
     est_usd = (est_tokens / 1_000_000) * _price(model)
     await _check_spend_cap(est_usd)
 
     last_err: Optional[Exception] = None
+    started_monotonic = time.monotonic()
     for attempt in range(_MAX_RETRIES):
         try:
             resp = await _get_client().chat.completions.create(
@@ -106,12 +125,28 @@ async def _chat_completion(model: str, messages: list[dict]) -> str:
             )
             content = resp.choices[0].message.content or ""
             usage = getattr(resp, "usage", None)
-            if usage is not None and getattr(usage, "total_tokens", None):
-                actual_usd = (usage.total_tokens / 1_000_000) * _price(model)
-                await _add_spend(actual_usd)
+            if usage is not None:
+                input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                total_tokens = int(
+                    getattr(usage, "total_tokens", input_tokens + output_tokens) or 0
+                )
             else:
-                await _add_spend(est_usd)
-            return content
+                input_tokens = output_tokens = total_tokens = 0
+            actual_usd = (
+                (total_tokens / 1_000_000) * _price(model) if total_tokens else est_usd
+            )
+            await _add_spend(actual_usd)
+            latency_ms = int((time.monotonic() - started_monotonic) * 1000)
+            return LLMCallResult(
+                content=content,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cost_usd=actual_usd,
+                latency_ms=latency_ms,
+            )
         except RateLimitError as e:
             last_err = e
             await asyncio.sleep(_BASE_BACKOFF * (2 ** attempt))
@@ -124,8 +159,12 @@ async def _chat_completion(model: str, messages: list[dict]) -> str:
     raise RuntimeError(f"LLM call failed after {_MAX_RETRIES} attempts: {last_err}")
 
 
-async def llm_call_with_retry(system: str, user: str, model: str) -> str:
-    return await _chat_completion(
+async def chat_with_metadata(
+    *, system: str, user: str, model: str
+) -> LLMCallResult:
+    """Public v5 entry point: returns full LLMCallResult so callers can
+    record_llm_call() with real token counts + cost + latency."""
+    return await _chat_completion_with_metadata(
         model,
         [
             {"role": "system", "content": system},
@@ -134,12 +173,25 @@ async def llm_call_with_retry(system: str, user: str, model: str) -> str:
     )
 
 
+async def llm_call_with_retry(system: str, user: str, model: str) -> str:
+    """Backward-compat: content-only return. Used by v4_legacy."""
+    result = await _chat_completion_with_metadata(
+        model,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    return result.content
+
+
 async def llm_call_with_retry_messages(
     system: str, messages: list[dict], model: str
 ) -> str:
     """`messages` is an array of {role, content} already excluding system."""
     full = [{"role": "system", "content": system}] + list(messages)
-    return await _chat_completion(model, full)
+    result = await _chat_completion_with_metadata(model, full)
+    return result.content
 
 
 # ─── EMBEDDINGS ─────────────────────────────────────────────────────────────
