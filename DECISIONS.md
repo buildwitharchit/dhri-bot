@@ -425,6 +425,69 @@ This contradicts the original design doc plan (`01_data_model.md` originally sai
 
 ---
 
+## 2026-04-25 — Slice 2 verified: 6-tier retrieval ladder + answer scoring
+
+**Status:** Decided
+**Slice / Phase:** Slice 2
+
+**Decision:** VARC's question retrieval is a 6-tier fallback ladder, not a single retrieval call. Each tier broadens what counts as an acceptable question:
+
+1. Exact subskill + difficulty + unseen + difficulty-balanced (preferred)
+2. Exact subskill + unseen (any difficulty)
+3. Adjacent subskill + unseen (e.g., inference_basic ↔ inference_advanced)
+4. Any subskill + unseen
+5. Stale-seen (subskill match, served > 14 days ago) with acknowledgement string
+6. Oldest-seen (any subskill, oldest served_at) with acknowledgement string
+
+Tiers 5 and 6 prepend a transparency string ("We've seen this passage before — let's try it with fresh eyes." / "I'm running low on new questions in this category — let me serve one we did a while back to see how your thinking has changed."). Students always get a question; the retrieval ladder never returns null.
+
+Stale button taps (tapping a letter on an old question whose newer question is now active) route to the most recent unanswered attempt — not to the question whose buttons were tapped. This was important until slice 2.5 added keyboard closing; with slice 2.5, old keyboards are removed entirely, making stale taps physically impossible. The fallback logic remains as defense in depth.
+
+**Why:** Question banks have finite content. A student who answers many inference questions will eventually exhaust the unseen pool. The ladder ensures the bot always has *something* to serve, with transparency about why a familiar question is appearing.
+
+**Rejected alternatives:**
+- **Single retrieval call returning null on exhaustion:** rejected because students would hit dead ends after 50-100 questions.
+- **Generate questions on-the-fly:** rejected because LLM-generated questions don't match real CAT difficulty/style; we'd lose the question-bank quality.
+- **Tier acknowledgements as variable LLM-generated text:** rejected for consistency; the deterministic strings are clearer and avoid LLM cost.
+
+**Tradeoffs accepted:**
+- Tier 5/6 acknowledgements may feel apologetic. Acceptable; honesty > pretending we have infinite content.
+- Six tiers is more code than a single retrieval. Each tier is a thin SQL query; total complexity is ~150 lines. Maintainable.
+
+**Revisit when:** Question bank exceeds ~500 questions per subskill (currently ~50). At that point, tiers 5/6 will rarely fire and we can simplify.
+
+---
+
+## 2026-04-25 — Slice 2 verified: separate v5.student_question_attempts table
+
+**Status:** Decided  
+**Slice / Phase:** Slice 2
+
+(Already documented in the slice 2.5 DECISIONS_additions.md entry "v5.student_question_attempts replaces v4.attempts for v5 traffic" — see that entry. Keeping this header here as a chronological marker.)
+
+---
+
+## 2026-04-25 — Slice 2 verified: webhook auto-registration on deploy
+
+**Status:** Decided  
+**Slice / Phase:** Slice 2
+
+**Decision:** On Railway deploy, the v5 service auto-registers its webhook with Telegram (POST to `/setWebhook`) at startup, pointing to `/v5/webhook/{secret}`. This replaces v4's manual webhook setup during slice 2's "switching webhook to v5" step.
+
+**Why:** Removes a manual step from every deploy. Without this, every Railway redeploy would require us to manually re-register the webhook, which is error-prone (forgotten registrations cause silent traffic loss).
+
+**Rejected alternatives:**
+- **Manual setWebhook via curl after each deploy:** rejected for fragility.
+- **Single one-time setup script:** rejected because Railway's container model means startup happens fresh each deploy; doing it inline at startup is more reliable.
+
+**Tradeoffs accepted:**
+- Adds ~200ms to startup. Acceptable.
+- Multiple instances on the same secret would race to setWebhook; Telegram handles this idempotently.
+
+**Revisit when:** We move to a multi-region or load-balanced deploy. At that point we'd need to handle webhook registration more carefully.
+
+---
+
 ## 2026-04-25 — Skip is "seen" but not "answered"
 
 **Status:** Decided
