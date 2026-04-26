@@ -150,9 +150,17 @@ async def resolve_session(student_id: str, tg_id: int) -> tuple[str, Optional[di
                 datetime.now(tz=timezone.utc) - session["last_activity_at"]
             ).total_seconds()
             if gap_seconds < SESSION_GAP_MINUTES * 60:
-                # Continuation — bump activity, keep the state, no resume offer.
+                # Continuation — bump activity AND turn counter atomically,
+                # keep the state, no resume offer. Convention: message_count
+                # increments ONCE per orchestrator handle_message turn (per
+                # the slice-3 verification fix; not per persisted message).
                 await db.execute(
-                    "UPDATE v5.sessions SET last_activity_at = now() WHERE session_id = $1::uuid",
+                    """
+                    UPDATE v5.sessions
+                    SET last_activity_at = now(),
+                        message_count = message_count + 1
+                    WHERE session_id = $1::uuid
+                    """,
                     state_session_id,
                 )
                 return state_session_id, None, None
@@ -178,10 +186,14 @@ async def resolve_session(student_id: str, tg_id: int) -> tuple[str, Optional[di
 
 
 async def _open_session(student_id: str, *, primary_agent: str) -> str:
+    # message_count starts at 1 because opening a session is itself triggered
+    # by the user's first turn — staying at 0 would undercount the new
+    # session's first turn vs. every subsequent turn (which gets +1 in the
+    # continuation branch above).
     row = await db.fetchrow(
         """
-        INSERT INTO v5.sessions (student_id, primary_agent)
-        VALUES ($1::uuid, $2)
+        INSERT INTO v5.sessions (student_id, primary_agent, message_count)
+        VALUES ($1::uuid, $2, 1)
         RETURNING session_id
         """,
         student_id, primary_agent,
@@ -202,23 +214,38 @@ async def close_session(session_id: str, end_reason: str) -> None:
 
 async def cleanup_inactive_sessions() -> int:
     """Cron entry point. Closes any session whose last_activity_at is older
-    than SESSION_GAP_MINUTES, then runs the (slice-3-stub) post-close pipeline."""
+    than SESSION_GAP_MINUTES, clears the owning student's Redis active state,
+    then runs the (slice-3-stub) post-close pipeline.
+
+    Per Principle 3 / Bug 13: closing a session in Postgres without also
+    clearing state:tg:{tg_id} leaves Redis pointing at a closed session.
+    The next request's resolve_session would still detect the boundary and
+    recover, but only the cron + the user's next message together close the
+    loop — the cron alone leaves the Redis state stale for that window.
+    Clearing per-session keeps Redis in sync with Postgres at cron time."""
     rows = await db.fetch(
         f"""
-        SELECT session_id
-        FROM v5.sessions
-        WHERE ended_at IS NULL
-          AND last_activity_at < now() - interval '{SESSION_GAP_MINUTES} minutes'
+        SELECT s.session_id, st.tg_id
+        FROM v5.sessions s
+        JOIN v5.students st ON st.student_id = s.student_id
+        WHERE s.ended_at IS NULL
+          AND s.last_activity_at < now() - interval '{SESSION_GAP_MINUTES} minutes'
         """
     )
     closed = 0
     for row in rows:
         sid = str(row["session_id"])
         await close_session(sid, "inactivity_timeout")
+        if row["tg_id"] is not None:
+            # Only DEL the specific tg_id whose session was just closed.
+            await clear_active_session(row["tg_id"])
         await process_session_end(sid)
         closed += 1
     if closed:
-        logger.info("v5 cleanup: closed %d inactive session(s)", closed)
+        logger.info(
+            "v5 cleanup: closed %d inactive session(s) and cleared Redis state",
+            closed,
+        )
     return closed
 
 
