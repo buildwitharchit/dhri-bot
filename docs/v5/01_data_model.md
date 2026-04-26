@@ -9,6 +9,8 @@ dhri v5 is structured around four storage layers, each with a distinct purpose:
 3. **pgvector (Postgres extension):** embedding-based retrieval for questions and (eventually) messages
 4. **Existing v4 tables (kept):** questions, passages, attempts, subskills, traps — domain content
 
+**Postgres schema separation:** All v5 tables live in a dedicated `v5` Postgres schema. v4 tables continue to live in `public`. v5 services qualify all table names (`v5.students`, `v5.messages`, etc.). This keeps v5 truly append-only and lets v4 stay 100% functional during the v5 build, supporting the strangler-fig migration discipline. Schema names are omitted in this document for clarity but should be applied in actual SQL (`v5.students`, `public.questions`, etc.).
+
 The fundamental principle: **Postgres is the source of truth. Redis is a performance cache.** If Redis goes down or evicts keys, the system rehydrates from Postgres. No data loss.
 
 This document covers all data shapes. Relationships, examples, lifecycles. Read this before reading service contracts — it's the foundation.
@@ -88,6 +90,8 @@ onboarding_complete     BOOLEAN DEFAULT false
 onboarding_step         VARCHAR(30)       (FSM state during onboarding; null when complete)
 onboarding_started_at   TIMESTAMP         (nullable)
 onboarding_completed_at TIMESTAMP         (nullable)
+onboarding_paused_at    TIMESTAMP         (nullable; set when student taps "Pause onboarding"; cleared when they resume)
+diagnostic_question_count SMALLINT DEFAULT 0  (incremented during onboarding diagnostic; reaches 5 then triggers mentor synthesis)
 created_at              TIMESTAMP DEFAULT now()
 last_updated            TIMESTAMP DEFAULT now()
 ```
@@ -250,6 +254,7 @@ session_id           UUID             (FK to sessions, indexed, nullable for bet
 role                 VARCHAR(20) NOT NULL  ('user' | 'assistant' | 'system')
 content              TEXT NOT NULL
 content_type         VARCHAR(20) DEFAULT 'text'  ('text' | 'button' | 'voice' | 'image')
+tg_update_id         BIGINT           (nullable, only set on user messages; Telegram's update_id for webhook idempotency)
 metadata             JSONB DEFAULT '{}'
 embedding            vector(1536)     (nullable, populated async for important messages)
 created_at           TIMESTAMP DEFAULT now()
@@ -285,9 +290,15 @@ For `role='assistant'`:
   },
   "retrieval_used": true,
   "retrieved_question_id": "q-uuid-789",
-  "fallback_tier": 1
+  "fallback_tier": 1,
+  "response_type": "question_serve" | "answer_explanation" | "skip_explanation" | "mid_question_doubt_ack" | "continuation_prompt" | "session_resume_prompt" | "off_topic_redirect" | "session_stats" | "error_fallback",
+  "tg_message_id": 56789,
+  "keyboard_active": true,
+  "previous_question_message_id": 56788
 }
 ```
+
+The `response_type` field is critical for analytics and for downstream services to know what kind of response was just sent. The `previous_question_message_id` (when present) is the tg_message_id of the question whose keyboard we should close on the next question serve (Bug 11 mitigation).
 
 For `role='system'` (rare; for system events like "session started"):
 ```json
@@ -324,10 +335,11 @@ For `role='system'` (rare; for system events like "session started"):
 - `(student_id, created_at DESC)` (composite, primary access pattern)
 - `session_id`
 - `created_at` (for time-range queries)
+- `tg_update_id` (UNIQUE partial index where tg_update_id IS NOT NULL; for webhook idempotency — if Telegram retries an update, we detect the duplicate before reprocessing)
 - HNSW index on `embedding` (for similarity search; created when embedding column becomes populated)
 
 **Lifecycle:**
-- User messages: inserted synchronously by orchestrator at start of request (BEFORE agent runs)
+- User messages: inserted synchronously by orchestrator at start of request (BEFORE agent runs). The orchestrator first checks if `tg_update_id` already exists; if so, the request is a Telegram webhook retry and is short-circuited with the cached prior response.
 - Assistant messages: inserted synchronously by orchestrator after agent returns
 - System messages: rare, inserted on specific events
 - Embeddings: populated asynchronously after response sent. Not all messages get embedded. Selection criteria:
@@ -337,7 +349,7 @@ For `role='system'` (rare; for system events like "session started"):
   - Otherwise skip (most "thanks" / "ok" / button presses are skipped)
 
 **Written by:** orchestrator
-**Read by:** orchestrator (loading recent turns), memory service (embedding search), eval service (replay)
+**Read by:** orchestrator (loading recent turns, idempotency check), memory service (embedding search), eval service (replay)
 
 ---
 
@@ -544,6 +556,93 @@ out_of_scope_query            (for guardrail tracking)
 
 ---
 
+### `student_question_attempts`
+
+Tracks every question served to a student, plus their answer (if given). Introduced in slice 2; supersedes the v4 `attempts` table for v5 traffic.
+
+```
+student_question_attempts
+─────────────────────────
+id                   UUID PRIMARY KEY DEFAULT gen_random_uuid()
+student_id           UUID NOT NULL    (FK to students, indexed)
+question_id          UUID NOT NULL    (FK to public.questions, indexed)
+session_id           UUID             (FK to sessions, nullable for backward compat with slice 2 which predates session auto-create)
+served_at            TIMESTAMP DEFAULT now()
+answered_at          TIMESTAMP        (nullable; null means student hasn't answered yet)
+is_correct           BOOLEAN          (nullable; null when unanswered or skipped)
+student_answer       VARCHAR(10)      (nullable; null when unanswered or skipped; 'A'|'B'|'C'|'D' otherwise)
+skipped              BOOLEAN DEFAULT FALSE  (true when student tapped "Skip / I don't know"; explanation still shown but no correctness recorded)
+explanation_shown    BOOLEAN DEFAULT FALSE
+is_diagnostic        BOOLEAN DEFAULT FALSE  (true for the 5 onboarding diagnostic questions; analytics flag)
+fallback_tier        SMALLINT         (1-6, which tier of the retrieval ladder served this question)
+```
+
+**Example rows:**
+
+```json
+[
+  {
+    "id": "att-uuid-1",
+    "student_id": "550e8400-...",
+    "question_id": "q-uuid-42",
+    "session_id": "sess-uuid-xyz",
+    "served_at": "2026-04-25T10:05:00Z",
+    "answered_at": "2026-04-25T10:06:30Z",
+    "is_correct": true,
+    "student_answer": "B",
+    "skipped": false,
+    "explanation_shown": true,
+    "is_diagnostic": false,
+    "fallback_tier": 2
+  },
+  {
+    "id": "att-uuid-2",
+    "student_id": "550e8400-...",
+    "question_id": "q-uuid-43",
+    "session_id": "sess-uuid-xyz",
+    "served_at": "2026-04-25T10:08:00Z",
+    "answered_at": "2026-04-25T10:08:45Z",
+    "is_correct": null,
+    "student_answer": null,
+    "skipped": true,
+    "explanation_shown": true,
+    "is_diagnostic": false,
+    "fallback_tier": 3
+  },
+  {
+    "id": "att-uuid-3",
+    "student_id": "550e8400-...",
+    "question_id": "q-uuid-44",
+    "session_id": "sess-uuid-xyz",
+    "served_at": "2026-04-25T10:10:00Z",
+    "answered_at": null,
+    "is_correct": null,
+    "student_answer": null,
+    "skipped": false,
+    "explanation_shown": false,
+    "is_diagnostic": false,
+    "fallback_tier": 1
+  }
+]
+```
+
+**Indexes:**
+- `(student_id, served_at DESC)` — primary access (recent activity)
+- `(student_id, answered_at)` partial WHERE `answered_at IS NULL` — fast "last unanswered" lookup
+- `(student_id, question_id)` — duplicate-detection / "have they seen this question?" queries
+- `is_diagnostic` — analytics
+
+**Lifecycle:**
+- Inserted on every question serve (one row per serve, even repeats — repeats are allowed in tier 5/6 fallback)
+- Updated when student answers OR skips (answered_at, is_correct, student_answer, skipped, explanation_shown set)
+- An attempt with `answered_at IS NULL` and `skipped = FALSE` represents an "open question" the student hasn't engaged with yet. There can be at most one open question per student at a time (enforced by application logic, not DB constraint).
+- Skipped attempts (`skipped = TRUE`) are still considered "seen" by the retrieval ladder — the student saw the question even if they didn't answer it.
+
+**Written by:** VARC agent (insert on serve, update on answer/skip)
+**Read by:** VARC agent (retrieval ladder seen-set query, last-unanswered lookup), profile service (skill signal calculation), session-end pipeline (extraction context)
+
+---
+
 ### `scheduled_messages` (skeleton table for v2; structure now, no use yet)
 
 Placeholder table. Empty in v1 but defined so we don't need migration later.
@@ -583,15 +682,13 @@ Existing schema with technique fingerprints, traps, subskills.
 
 ### `passages` — KEPT, no changes needed
 
-### `attempts` — KEPT, minor addition
+### `attempts` — KEPT (v4 historical, read-only in v5)
 
-Add column:
-```
-attempts (existing) + new column:
-session_id           UUID             (FK to sessions, nullable for backward compat)
-```
+The v4 `attempts` table holds historical attempt data from v4 traffic. It is NOT written to by v5 services. v5 introduces a fresh `student_question_attempts` table (documented above) that is the source of truth for v5 traffic.
 
-This links attempts to the new sessions table for analytics.
+We do NOT add a `session_id` column to v4's `attempts` (earlier plan rescinded). v4 attempts and v5 attempts are kept in parallel, both readable by analytics if needed but written only by their respective version. After v4 is fully retired (post-slice-8 quality pass), v4 `attempts` may be archived.
+
+This split avoids destructive schema changes to v4 tables during the v5 build, supporting the strangler-fig migration discipline.
 
 ### `user_skill_scores` — KEPT, no changes needed
 
@@ -638,6 +735,8 @@ TTL:    7200 seconds (2 hours), reset on every interaction
   "started_at": "2026-04-25T10:00:00Z",
   "last_activity_at": "2026-04-25T10:23:00Z",
   "message_count_in_session": 12,
+  "last_question_message_id": 56789,
+  "last_question_attempt_id": "att-uuid-3",
   "domain_state": {
     "passage_id": "passage-uuid-1",
     "current_question_id": "q-uuid-3",
@@ -659,13 +758,19 @@ TTL:    7200 seconds (2 hours), reset on every interaction
 }
 ```
 
+**Field notes:**
+- `last_question_message_id` — Telegram message_id of the most recently served question. Used to remove its inline keyboard via `editMessageReplyMarkup` when a new question is served (Bug 11 mitigation: prevents stale keyboards from accumulating).
+- `last_question_attempt_id` — Database ID of the most recent unanswered attempt row. Used to disambiguate stale button taps (a tap on an old question always routes to the most recent unanswered attempt).
+- `domain_state` — agent-specific state. For VARC, includes current question-set context.
+
 **Notes:**
 - If key doesn't exist, no active session — first message starts one
 - TTL refreshed on every write
 - Lost on Redis eviction; rehydrated from sessions table + last assistant message metadata if needed
+- **Cleared on session boundary:** When a new session starts (after 30+ minute gap, explicit end, or session switch), this key is DELETED before being recreated for the new session. domain_state from the closed session does NOT leak into the new session. (Bug 13 mitigation.)
 
-**Written by:** orchestrator (create, update), session cleanup cron (delete)
-**Read by:** orchestrator (every turn)
+**Written by:** orchestrator (create, update, clear-on-boundary), session cleanup cron (delete on inactivity timeout)
+**Read by:** orchestrator (every turn), VARC agent (via context.active_session in AgentContext)
 
 ---
 
@@ -826,11 +931,22 @@ IntentClassification {
     action: "practice_request" | "answer_to_question" | "doubt_about_current" 
           | "concept_question" | "review_progress" | "vent" | "casual" 
           | "switch_topic" | "explicit_end" | "onboarding_response"
-    continuation: "continues_current_session" | "switches_topic" | "new_session"
+          | "small_talk"  // brief acknowledgments: "ok", "thanks", "got it" — does NOT trigger question serve
+          | "skip_request"  // student wants to skip current question
+          | "stats_request"  // mid-session "how am I doing"
+          | "navigation"  // back, edit a previous answer (rare)
+    continuation: "continues_current_session" | "switches_topic" | "new_session" | "stays_on_question"
     emotional_tone: "neutral" | "low" | "high" | "stressed" | "confident" | "frustrated"
     depth: "quick_query" | "full_engagement"
     references_past: "current_question" | "earlier_in_session" | "past_session" | "none"
-    specific_focus: string (nullable)  // e.g., "inference", "main_idea"
+    specific_focus: string (nullable)  // see subskill enum below
+    subskill: string (nullable)  // EXACT match against question bank's subskill column; see enum below
+    difficulty: "easy" | "medium" | "hard" (nullable)  // if null, profile-derived default applies
+    secondary_signal: {  // (Bug 15) for mixed-intent messages like "I'm stressed, give me an easy one"
+      type: "emotional_undertone" | "side_request" | null
+      value: string (nullable)  // e.g., "mild_stress", "fatigue", "wants_easy"
+    }
+    confidence: float (0.0-1.0)
   }
   context_needs: {
     profile: "minimal" | "full" | "skip"
@@ -862,6 +978,30 @@ IntentClassification {
 }
 ```
 
+**Subskill enum (must match question bank exactly — Bug 22):**
+- `inference_basic`
+- `inference_advanced`
+- `main_idea_full_passage`
+- `specific_detail`
+- `passage_summary`
+- `sentence_insertion`
+- `sentence_odd_one_out`
+- `strengthen_weaken`
+- `purpose_of_example`
+- `vocab_in_context`
+- `author_tone`
+- `para_jumble` (PJ — has its own answer-input mode; defer routing to dedicated handler)
+
+If the planner returns a subskill not in this enum, the VARC agent falls back to `inference_basic` (default) and logs the misclassification for prompt iteration.
+
+**The small_talk vs practice_request distinction (Bug 15 critical guidance):**
+
+After a recent question + answer turn, brief acknowledgments must be classified as `small_talk`, not `practice_request`. The bot's response to small_talk is a warm acknowledgment + re-show of continuation buttons — NOT a new question.
+
+- `practice_request` requires explicit forward intent: "another", "next", "more", "give me", "let's continue"
+- `small_talk` covers: "ok", "thanks", "got it", "i see", "alright", "hmm", "interesting" (after recent context)
+- When in doubt, prefer `small_talk` — the bot will then ask the student what they want next, never auto-serving.
+
 **Lifecycle:** created in step 5 of orchestrator flow, used in steps 6-10, persisted to messages.metadata
 
 ---
@@ -891,9 +1031,12 @@ AgentContext {
     domain_state: object (nullable)
     started_at: datetime (nullable)
     message_count: integer
+    last_question_message_id: integer (nullable)  // tg_message_id of most recent question for keyboard close
+    last_question_attempt_id: UUID (nullable)     // attempt row of most recent unanswered question
   }
   
   profile_brief: string (nullable)        // assembled if context_needs.profile != "skip"
+  default_difficulty: string              // "easy" | "medium" | "hard"; from profile_service.get_default_difficulty (Bug 23)
   
   episodic_summaries: [                    // populated if context_needs.episodic.needed
     {
@@ -922,10 +1065,28 @@ AgentContext {
     message_id: UUID
     timestamp: datetime
   }
+  
+  // Slice 2.5+ additions for new flows:
+  
+  mid_question_doubt: boolean              // true if student typed text mid-question (Bug 1)
+  current_unanswered_attempt: object | null  // the open attempt row, if any (Bug 1, Bug 8)
+  is_diagnostic_mode: boolean              // true during onboarding diagnostic Q1-Q5 (auto-continue allowed)
+  skipped_attempt_id: UUID (nullable)      // set when student tapped skip button (Bug 8)
+  session_resume_candidate: object | null  // set when returning after break with unfinished work (Bug 2):
+                                           //   { last_question_id, last_question_subskill, last_session_summary, days_since_break }
+  session_stats: object | null             // populated only if intent.action == "stats_request" (Bug 12)
+  retry_context: object | null             // set when student tapped [Try again] after error fallback (Bug 18)
 }
 ```
 
-**Lifecycle:** assembled in step 7 of orchestrator flow, passed to agent in step 8, discarded after response
+**Lifecycle:** assembled in step 9 of orchestrator flow, passed to agent in step 10, discarded after response.
+
+**Notes on slice progression:**
+- Slice 1: only basic fields populated; new fields default to null/false
+- Slice 2: adds current_unanswered_attempt, skipped_attempt_id (for skip + answer flow)
+- Slice 2.5: adds mid_question_doubt, retry_context
+- Slice 3: adds session_resume_candidate (returning-after-break)
+- Slice 4+: full population with planner-driven intent
 
 ---
 
@@ -937,17 +1098,47 @@ What agents return to the orchestrator.
 AgentResponse {
   content: string                          // the actual response text
   content_type: string                     // 'text' | 'text_with_keyboard'
-  keyboard: object (nullable)              // inline keyboard structure for buttons
+  
+  keyboard_buttons: [                      // structured button definitions; orchestrator builds Telegram InlineKeyboard from this
+    [                                      // each inner array is a row of buttons
+      { text: "Next question", callback_data: "v5_continue_next" },
+      { text: "Different subskill", callback_data: "v5_continue_switch_subskill" }
+    ],
+    [
+      { text: "I have a doubt", callback_data: "v5_continue_doubt" },
+      { text: "I'm done", callback_data: "v5_continue_done" }
+    ]
+  ]
+  
+  response_type: string                    // analytics & downstream routing label; see enum below
+  requires_keyboard_close: boolean         // if true, orchestrator removes inline keyboard from previous question (Bug 11, Principle 2)
   
   memory_deltas: {
-    new_assistant_turn: object             // turn data to append
-    active_context_updates: object         // partial updates to active session state
-    new_session: object (nullable)         // new session row if creating
-    close_session: object (nullable)       // session_id + end_reason if closing
-    attempt_record: object (nullable)      // attempt to record (if answering question)
+    new_assistant_turn: object             // turn data to append to working memory cache
+    active_context_updates: object         // partial updates to active session Redis state
+    new_session: object (nullable)         // new session row to create (rare; orchestrator usually handles session creation)
+    close_session: object (nullable)       // { session_id, end_reason } if explicit_end
+    attempt_record: {                      // present when serving a question OR processing answer/skip
+      operation: "insert" | "update"
+      data: {
+        student_id: UUID
+        question_id: UUID
+        served_at?: datetime               // for insert
+        answered_at?: datetime             // for update
+        is_correct?: boolean | null        // for update; null if skipped
+        student_answer?: string | null     // for update; null if skipped
+        skipped?: boolean                  // for update
+        explanation_shown?: boolean        // for update
+        fallback_tier?: integer            // for insert
+        is_diagnostic?: boolean            // for insert; true during onboarding diagnostic
+      }
+    } (nullable)
+    close_previous_keyboard: {             // populated when requires_keyboard_close=true (Bug 11)
+      tg_message_id: integer
+    } (nullable)
   }
   
-  observer_events: [                       // events to insert
+  observer_events: [                       // events to insert into observer_events table
     {
       event_type: string
       payload: object
@@ -955,20 +1146,43 @@ AgentResponse {
   ]
   
   meta: {
-    agent: string
-    model_used: string
-    input_tokens: integer
-    output_tokens: integer
-    cost_usd: float
+    agent: string                          // "varc" | "mentor" | "orchestrator" (for orchestrator-composed responses)
+    model_used: string (nullable)          // null when no LLM call (e.g., orchestrator small_talk response)
+    input_tokens: integer (default 0)
+    output_tokens: integer (default 0)
+    cost_usd: float (default 0.0)
     generation_latency_ms: integer
     retrieval_used: boolean
     retrieved_question_id: UUID (nullable)
-    fallback_tier: integer (1-6)
+    fallback_tier: integer (1-6, nullable)
+    response_type: string                  // duplicated here for analytics convenience
   }
 }
 ```
 
-**Lifecycle:** returned by agent in step 9, processed in steps 10-13 of orchestrator flow
+**`response_type` enum:**
+- `question_serve` — served a new question
+- `answer_explanation` — scoring + explanation after student answered
+- `skip_explanation` — explanation after student skipped (no scoring)
+- `mid_question_doubt_ack` — acknowledged a doubt while preserving current question
+- `concept_explanation` — taught a concept (no question retrieval)
+- `topic_switch_ack` — acknowledged a subskill/topic switch
+- `session_wrap` — explicit end response
+- `session_resume_prompt` — returning-after-break "want to resume?" response
+- `mentor_strategic_response` — mentor's reactive response
+- `mentor_diagnostic_synthesis` — mentor's onboarding synthesis (one-time)
+- `continuation_prompt` — orchestrator-composed warm acknowledgment for small_talk
+- `session_stats` — orchestrator-composed stats response for stats_request
+- `off_topic_redirect` — orchestrator-composed soft-redirect
+- `error_fallback` — canned error message after agent failure
+
+**Lifecycle:** returned by agent in step 10, processed in steps 11-13 of orchestrator flow.
+
+**Important invariants:**
+- Every AgentResponse from VARC or Mentor MUST have non-empty `keyboard_buttons` (per Principle 1), EXCEPT:
+  - `response_type == "session_wrap"` (explicit end, no continuation)
+  - When `is_diagnostic_mode == true` and not on Q5 (diagnostic exception)
+- `requires_keyboard_close` is true ONLY when `response_type == "question_serve"` (the only case where we're replacing the previously-active question's keyboard)
 
 ---
 

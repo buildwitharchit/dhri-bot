@@ -1,17 +1,24 @@
 # services/orchestrator/main.py
 #
-# Slice 1: minimal end-to-end flow.
-#   identity → lock → persist user msg → hardcoded route → agent →
-#   persist assistant msg → cache turns → release lock → return.
+# Slice 2.5 layered on slice 2:
 #
-# Stubbed (filled in later slices):
-#   - Planner LLM call (slice 4)
-#   - Onboarding FSM (slice 6)
-#   - Rate limiting / spend caps (slice 4)
-#   - Profile-aware context (slice 5)
-#   - Episodic / specific-message retrieval (slice 7+)
-#   - Session lifecycle (slice 3)
-#   - Observer events (slice 8)
+#   Step 0   Webhook idempotency check via tg_update_id           (Fix 7)
+#   Step 1   Identity resolution + ensure profile
+#   Step 1.5 Lock acquisition (Redis SETNX)
+#   Step 2   Persist user message (try/except — fail loud)         (Fix 6)
+#   Step 6.5 Deterministic action classification:                  (Fixes 1, 2, 4, 5)
+#              - skip / show / continuation / retry callbacks
+#              - free-text answer regex
+#              - free-text mid-question doubt detection
+#              - default → practice_request
+#   Step 6.7 Orchestrator-direct actions (stats / done / retry)    (Fix 4)
+#   Step 7-10 Build agent context, route to agent
+#   Step 11.5 Attach previous_question_message_id to response meta (Fix 3)
+#   Step 12  Persist assistant message (try/except — fail loud)    (Fix 6)
+#   Step 13  Memory cache deltas (try/except — log + continue)     (Fix 6)
+#
+# Stubbed for later slices: planner LLM (slice 4), session lifecycle (slice 3),
+# real profile injection (slice 5), onboarding (slice 6), observer (slice 8).
 
 import json
 import logging
@@ -19,10 +26,10 @@ import re
 from typing import Any, Optional
 
 from shared.db.client import db
-from shared.redis.client import acquire_lock, release_lock
+from shared.redis.client import acquire_lock, get_state, release_lock
 
 from services.memory.main import append_turn, get_recent_turns
-from services.profile.main import ensure_profile, get_minimal_brief
+from services.profile.main import ensure_profile, get_minimal_brief, get_session_stats
 from services.varc.main import handle as varc_handle
 from services.mentor.main import handle as mentor_handle
 
@@ -31,13 +38,12 @@ logger = logging.getLogger(__name__)
 LOCK_TTL_SECONDS = 5
 RECENT_TURNS_FOR_CONTEXT = 10
 
-# Slice 2 answer detection. Free text "B" / "b" / "2", or a button callback
-# with payload "v5_answer_<question_id>_<letter>". Anything else is treated
-# as a fresh practice request.
 _ANSWER_LETTER_RE = re.compile(r"^\s*([A-Da-d])\s*$")
 _ANSWER_NUMBER_RE = re.compile(r"^\s*([1-4])\s*$")
 _NUMBER_TO_LETTER = {"1": "A", "2": "B", "3": "C", "4": "D"}
-_BUTTON_PREFIX = "v5_answer_"
+
+
+# ─── public entry point ─────────────────────────────────────────────────────
 
 
 async def handle_message(
@@ -46,94 +52,112 @@ async def handle_message(
     content_type: str = "text",
     source_metadata: Optional[dict] = None,
 ) -> dict:
-    """Top-level entry. Returns an AgentResponse-shaped dict for the bus to render."""
     source_metadata = source_metadata or {}
+    tg_update_id = source_metadata.get("tg_update_id")
 
+    # Step 0: webhook idempotency (Fix 7)
+    if tg_update_id is not None:
+        retry_response = await _check_telegram_retry(tg_update_id)
+        if retry_response is not None:
+            return retry_response
+
+    # Step 1: identity
     student_id = await _ensure_student(tg_id, source_metadata.get("first_name"))
     await ensure_profile(student_id)
 
+    # Step 1.5: lock
     lock_key = f"lock:user:{tg_id}"
     if not await acquire_lock(lock_key, LOCK_TTL_SECONDS):
         return _canned("Still working on your last message — hang on a sec.")
 
     try:
-        user_msg_id = await _persist_message(
-            student_id=student_id,
-            role="user",
-            content=content,
-            content_type=content_type,
-            metadata={
-                "tg_message_id": source_metadata.get("tg_message_id"),
-                "tg_chat_id": source_metadata.get("tg_chat_id"),
-            },
-        )
+        # Step 2: persist user message (Fix 6 — fail loud BEFORE response)
+        try:
+            user_msg_id = await _persist_message(
+                student_id=student_id,
+                role="user",
+                content=content,
+                content_type=content_type,
+                metadata={
+                    "tg_message_id": source_metadata.get("tg_message_id"),
+                    "tg_chat_id": source_metadata.get("tg_chat_id"),
+                },
+                tg_update_id=tg_update_id,
+            )
+        except Exception:
+            logger.exception("step2 db failure persisting user message tg_id=%s", tg_id)
+            return _canned("Hmm, something went wrong saving your message. Try once more?")
 
         recent_turns = await get_recent_turns(tg_id, limit=RECENT_TURNS_FOR_CONTEXT)
 
-        # Slice-2 answer detection: if the message looks like an A/B/C/D answer
-        # AND there's a most-recent unanswered serve for this student, attach
-        # it so VARC can score before serving the next question.
-        detected_answer = _detect_answer(content, content_type)
-        last_attempt = None
-        if detected_answer is not None:
-            last_attempt = await _fetch_last_unanswered_attempt(student_id)
-        last_question_attempt = (
-            {"detected_answer": detected_answer, "attempt_row": last_attempt}
-            if (detected_answer is not None and last_attempt is not None)
-            else None
-        )
+        # Pre-fetch most-recent unanswered attempt — drives multiple decisions
+        last_unanswered = await _fetch_last_unanswered_attempt(student_id)
 
-        # Stubbed planner — slice 4 replaces this with a real LLM call.
-        intent = {
-            "domain": "varc",
-            "action": "answer_to_question" if last_question_attempt else "practice_request",
-            "continuation": "continues_current_session" if last_question_attempt else "new_session",
-            "emotional_tone": "neutral",
-        }
+        # Step 6.5: deterministic action classification
+        intent, payload = await _classify_action(content, content_type, last_unanswered)
 
-        profile_brief = await get_minimal_brief(student_id)
-
-        agent_context = {
-            "student_id": student_id,
-            "tg_id": tg_id,
-            "recent_turns": recent_turns,
-            "profile_brief": profile_brief,
-            "intent": intent,
-            "last_question_attempt": last_question_attempt,
-            "current_message": {
-                "content": content,
-                "content_type": content_type,
-                "message_id": user_msg_id,
-            },
-        }
-
-        if intent["domain"] == "varc":
-            response = await varc_handle(agent_context)
+        # Step 6.7: orchestrator-direct actions (no agent invocation)
+        if intent["domain"] == "orchestrator":
+            response = await _handle_orchestrator_action(
+                intent, student_id, tg_id, source_metadata,
+            )
         else:
-            response = await mentor_handle(agent_context)
+            agent_context = {
+                "student_id": student_id,
+                "tg_id": tg_id,
+                "recent_turns": recent_turns,
+                "profile_brief": await get_minimal_brief(student_id),
+                "intent": intent,
+                "current_unanswered_attempt": last_unanswered,
+                "current_message": {
+                    "content": content,
+                    "content_type": content_type,
+                    "message_id": user_msg_id,
+                },
+                **payload,
+            }
+            if intent["domain"] == "varc":
+                response = await varc_handle(agent_context)
+            else:
+                response = await mentor_handle(agent_context)
 
-        await _persist_message(
-            student_id=student_id,
-            role="assistant",
-            content=response["content"],
-            content_type=response.get("content_type", "text"),
-            metadata={
-                "intent_classification": intent,
-                **(response.get("meta") or {}),
-            },
-        )
+        # Step 11.5: keyboard close hint (Fix 3) — bus reads this to call
+        # editMessageReplyMarkup on the previous question's message.
+        if response.get("requires_keyboard_close"):
+            state = await get_state(tg_id) or {}
+            response.setdefault("meta", {})["previous_question_message_id"] = (
+                state.get("last_question_message_id")
+            )
 
-        await append_turn(tg_id, {
-            "role": "user",
-            "content": content,
-            "content_type": content_type,
-            "message_id": user_msg_id,
-        })
-        await append_turn(tg_id, {
-            "role": "assistant",
-            "content": response["content"],
-            "content_type": response.get("content_type", "text"),
-        })
+        # Step 12: persist assistant message (Fix 6 — fail loud)
+        try:
+            await _persist_message(
+                student_id=student_id,
+                role="assistant",
+                content=response["content"],
+                content_type=response.get("content_type", "text"),
+                metadata={
+                    "intent_classification": intent,
+                    **(response.get("meta") or {}),
+                },
+            )
+        except Exception:
+            logger.exception("step12 db failure persisting assistant message tg_id=%s", tg_id)
+            return _canned("Hmm, something went wrong saving the response. Try once more?")
+
+        # Step 13: memory cache deltas (Fix 6 — log + continue, response already shaped)
+        try:
+            await append_turn(tg_id, {
+                "role": "user", "content": content, "content_type": content_type,
+                "message_id": user_msg_id,
+            })
+            await append_turn(tg_id, {
+                "role": "assistant",
+                "content": response["content"],
+                "content_type": response.get("content_type", "text"),
+            })
+        except Exception:
+            logger.exception("step13 cache write failure tg_id=%s (continuing)", tg_id)
 
         return response
     except Exception:
@@ -143,15 +167,149 @@ async def handle_message(
         await release_lock(lock_key)
 
 
-def _detect_answer(content: str, content_type: str) -> Optional[str]:
-    """Return 'A'|'B'|'C'|'D' if the message looks like an answer, else None."""
-    if content_type == "button" and content.startswith(_BUTTON_PREFIX):
-        # callback_data shape: v5_answer_<question_id>_<letter>
-        tail = content.rsplit("_", 1)[-1].upper()
-        if tail in {"A", "B", "C", "D"}:
-            return tail
+# ─── Step 0: idempotency (Fix 7) ────────────────────────────────────────────
+
+
+async def _check_telegram_retry(tg_update_id: int) -> Optional[dict]:
+    """If we've seen this update_id before, this is a Telegram retry. Return
+    the prior assistant response if it exists, else a brief in-flight notice."""
+    duplicate = await db.fetchrow(
+        """
+        SELECT message_id, student_id, created_at
+        FROM v5.messages
+        WHERE tg_update_id = $1
+        LIMIT 1
+        """,
+        tg_update_id,
+    )
+    if duplicate is None:
         return None
-    if content_type != "text":
+
+    logger.info("idempotency: telegram retry detected for update_id=%s", tg_update_id)
+    paired = await db.fetchrow(
+        """
+        SELECT content, content_type
+        FROM v5.messages
+        WHERE student_id = $1 AND role = 'assistant' AND created_at > $2
+        ORDER BY created_at ASC
+        LIMIT 1
+        """,
+        duplicate["student_id"], duplicate["created_at"],
+    )
+    if paired is not None:
+        return {
+            "content": paired["content"],
+            "content_type": paired["content_type"],
+            "keyboard": None,  # keyboard reconstruction deferred (slice 4+)
+            "requires_keyboard_close": False,
+            "memory_deltas": {},
+            "observer_events": [],
+            "meta": {
+                "agent": "orchestrator",
+                "response_type": "retry_redelivery",
+                "is_retry": True,
+            },
+        }
+    return {
+        "content": "Still working on your previous message — hang on.",
+        "content_type": "text",
+        "keyboard": None,
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {
+            "agent": "orchestrator",
+            "response_type": "retry_in_flight",
+            "is_retry": True,
+        },
+    }
+
+
+# ─── Step 6.5: deterministic action classification ─────────────────────────
+
+
+async def _classify_action(
+    content: str,
+    content_type: str,
+    last_unanswered: Optional[dict],
+) -> tuple[dict, dict]:
+    """Returns (intent_dict, agent_context_payload).
+    payload is merged into agent_context (e.g., last_question_attempt,
+    skipped_attempt, show_attempt)."""
+
+    if content_type == "button":
+        if content.startswith("v5_skip_"):
+            attempt_id = content[len("v5_skip_"):]
+            attempt = await _fetch_attempt_by_id(attempt_id)
+            if attempt and attempt["answered_at"] is None:
+                return _intent("varc", "skip_request"), {"skipped_attempt": attempt}
+            # Stale skip (already answered) → fall through to default
+
+        elif content.startswith("v5_show_question_"):
+            attempt_id = content[len("v5_show_question_"):]
+            attempt = await _fetch_attempt_by_id(attempt_id)
+            if attempt:
+                return _intent("varc", "show_current_question"), {"show_attempt": attempt}
+
+        elif content.startswith("v5_continue_"):
+            sub = content[len("v5_continue_"):]
+            if sub == "next":
+                return _intent("varc", "practice_request"), {}
+            if sub == "stats":
+                return _intent("orchestrator", "stats_request"), {}
+            if sub == "doubt":
+                return _intent("varc", "continue_doubt"), {}
+            if sub == "subskill":
+                return _intent("varc", "subskill_switch"), {}
+            if sub == "done":
+                return _intent("orchestrator", "session_end"), {}
+
+        elif content == "v5_retry":
+            return _intent("orchestrator", "retry_last"), {}
+
+        elif content.startswith("v5_answer_"):
+            detected = _extract_answer_letter_from_callback(content)
+            if detected and last_unanswered is not None:
+                return _intent("varc", "answer_to_question"), {
+                    "last_question_attempt": {
+                        "detected_answer": detected,
+                        "attempt_row": last_unanswered,
+                    }
+                }
+            # Stale answer button (e.g., for an already-answered question) → default
+
+    if content_type == "text":
+        detected = _detect_text_answer(content)
+        if detected and last_unanswered is not None:
+            return _intent("varc", "answer_to_question"), {
+                "last_question_attempt": {
+                    "detected_answer": detected,
+                    "attempt_row": last_unanswered,
+                }
+            }
+        # Free text + active unanswered + NOT an answer → mid-question doubt
+        if last_unanswered is not None and detected is None:
+            return _intent("varc", "doubt_about_current"), {
+                "current_unanswered_attempt": last_unanswered,
+            }
+
+    # Default: fresh practice request
+    return _intent("varc", "practice_request"), {}
+
+
+def _intent(domain: str, action: str) -> dict:
+    return {
+        "domain": domain,
+        "action": action,
+        "continuation": (
+            "new_session" if action == "practice_request" else "continues_current_session"
+        ),
+        "emotional_tone": "neutral",
+    }
+
+
+def _detect_text_answer(content: str) -> Optional[str]:
+    if not content:
         return None
     m = _ANSWER_LETTER_RE.match(content)
     if m:
@@ -162,10 +320,121 @@ def _detect_answer(content: str, content_type: str) -> Optional[str]:
     return None
 
 
+def _extract_answer_letter_from_callback(content: str) -> Optional[str]:
+    # callback_data: v5_answer_<question_id>_<letter>
+    if not content.startswith("v5_answer_"):
+        return None
+    tail = content.rsplit("_", 1)[-1].upper()
+    return tail if tail in {"A", "B", "C", "D"} else None
+
+
+# ─── Step 6.7: orchestrator-direct actions ──────────────────────────────────
+
+
+async def _handle_orchestrator_action(
+    intent: dict,
+    student_id: str,
+    tg_id: int,
+    source_metadata: dict,  # noqa: ARG001  reserved for future use
+) -> dict:
+    action = intent["action"]
+    if action == "stats_request":
+        return await _build_stats_response(student_id)
+    if action == "session_end":
+        return _build_session_end_response()
+    if action == "retry_last":
+        return await _build_retry_response(student_id, tg_id)
+    return _canned("Something's not quite right — let's start fresh.")
+
+
+async def _build_stats_response(student_id: str) -> dict:
+    stats = await get_session_stats(student_id, session_id=None)
+    subskills = ", ".join(stats["top_subskills"]) if stats["top_subskills"] else "—"
+    lines = [
+        "*This session so far:*",
+        f"• Attempted: {stats['attempted']}, Correct: {stats['correct']}, Skipped: {stats['skipped']}",
+        f"• Accuracy: {stats['accuracy_pct']}%",
+        f"• Subskills practiced: {subskills}",
+        f"• Time: {stats['duration_min']} min",
+    ]
+    return {
+        "content": "\n".join(lines),
+        "content_type": "text_with_keyboard",
+        "keyboard": _continuation_keyboard_for_stats(),
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {"agent": "orchestrator", "response_type": "session_stats", **stats},
+    }
+
+
+def _build_session_end_response() -> dict:
+    return {
+        "content": "See you next time! 👋",
+        "content_type": "text",
+        "keyboard": None,
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {"agent": "orchestrator", "response_type": "session_end"},
+    }
+
+
+async def _build_retry_response(student_id: str, tg_id: int) -> dict:
+    """Find the most recent error_fallback assistant message and re-run from
+    its stashed_intent. If nothing is stashed, fall back to a fresh practice
+    request."""
+    row = await db.fetchrow(
+        """
+        SELECT metadata
+        FROM v5.messages
+        WHERE student_id = $1::uuid AND role = 'assistant'
+          AND metadata->>'response_type' = 'error_fallback'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        student_id,
+    )
+    metadata: dict = (row["metadata"] if row else {}) or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    stashed: Any = metadata.get("stashed_intent") if metadata else None
+
+    last_unanswered = await _fetch_last_unanswered_attempt(student_id)
+    base_context = {
+        "student_id": student_id,
+        "tg_id": tg_id,
+        "recent_turns": [],
+        "profile_brief": await get_minimal_brief(student_id),
+        "current_unanswered_attempt": last_unanswered,
+        "current_message": {"content": "", "content_type": "text", "message_id": None},
+    }
+    intent_to_run = stashed if isinstance(stashed, dict) else _intent("varc", "practice_request")
+    base_context["intent"] = intent_to_run
+    return await varc_handle(base_context)
+
+
+def _continuation_keyboard_for_stats() -> dict:
+    """Same as VARC's continuation row but minus the [Show my stats] button
+    (we just showed stats — no need to offer it again immediately)."""
+    return {"inline_keyboard": [
+        [{"text": "Next question", "callback_data": "v5_continue_next"},
+         {"text": "Different subskill", "callback_data": "v5_continue_subskill"}],
+        [{"text": "I have a doubt", "callback_data": "v5_continue_doubt"},
+         {"text": "I'm done", "callback_data": "v5_continue_done"}],
+    ]}
+
+
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+
 async def _fetch_last_unanswered_attempt(student_id: str) -> Optional[dict]:
     row = await db.fetchrow(
         """
-        SELECT id, question_id, served_at
+        SELECT id, question_id, served_at, answered_at, skipped
         FROM v5.student_question_attempts
         WHERE student_id = $1::uuid AND answered_at IS NULL
         ORDER BY served_at DESC
@@ -173,7 +442,30 @@ async def _fetch_last_unanswered_attempt(student_id: str) -> Optional[dict]:
         """,
         student_id,
     )
-    return dict(row) if row else None
+    if row is None:
+        return None
+    out = dict(row)
+    out["id"] = str(out["id"])
+    return out
+
+
+async def _fetch_attempt_by_id(attempt_id: str) -> Optional[dict]:
+    try:
+        row = await db.fetchrow(
+            """
+            SELECT id, question_id, served_at, answered_at, skipped
+            FROM v5.student_question_attempts
+            WHERE id = $1::uuid
+            """,
+            attempt_id,
+        )
+    except Exception:
+        return None
+    if row is None:
+        return None
+    out = dict(row)
+    out["id"] = str(out["id"])
+    return out
 
 
 async def _ensure_student(tg_id: int, display_name: Optional[str]) -> str:
@@ -194,8 +486,7 @@ async def _ensure_student(tg_id: int, display_name: Optional[str]) -> str:
         VALUES ($1, $2)
         RETURNING student_id
         """,
-        tg_id,
-        display_name,
+        tg_id, display_name,
     )
     return str(row["student_id"])
 
@@ -207,18 +498,18 @@ async def _persist_message(
     content: str,
     content_type: str,
     metadata: Optional[dict],
+    tg_update_id: Optional[int] = None,
 ) -> str:
     row = await db.fetchrow(
         """
-        INSERT INTO v5.messages (student_id, role, content, content_type, metadata)
-        VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
+        INSERT INTO v5.messages
+          (student_id, role, content, content_type, metadata, tg_update_id)
+        VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6)
         RETURNING message_id
         """,
-        student_id,
-        role,
-        content,
-        content_type,
+        student_id, role, content, content_type,
         json.dumps(_clean_metadata(metadata)),
+        tg_update_id,
     )
     return str(row["message_id"])
 
@@ -234,6 +525,7 @@ def _canned(text: str) -> dict:
         "content": text,
         "content_type": "text",
         "keyboard": None,
+        "requires_keyboard_close": False,
         "memory_deltas": {},
         "observer_events": [],
         "meta": {"agent": "orchestrator", "canned": True},

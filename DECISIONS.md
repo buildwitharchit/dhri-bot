@@ -293,6 +293,195 @@ For Sarvam application: DECISIONS.md is one of the strongest portfolio signals b
 
 ---
 
+## 2026-04-25 — Six architectural principles enshrined as cross-service invariants
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5 architectural review
+
+**Decision:** Six principles now bind every service in v5. They are documented in detail at the top of `docs/v5/02_service_contracts.md`. Summarized:
+
+1. **No auto-serve after answer.** The bot never auto-serves a question after a student answers/skips. Continuation buttons let the student choose. (Diagnostic test mode is the bounded exception.)
+2. **Old keyboards must be closed.** When a new question is served, orchestrator removes the inline keyboard from the previous question via Telegram's editMessageReplyMarkup.
+3. **Active session state cleared on boundary.** When a new session starts, `state:tg:{tg_id}` is deleted before being recreated. domain_state from the closed session never leaks.
+4. **Webhook idempotency via tg_update_id.** Duplicate Telegram retries are detected and short-circuited. UNIQUE partial index enforces this at the DB level.
+5. **UX never breaks on infrastructure failure.** Every failure mode has a graceful fallback: planner failure → safe default; LLM failure → retry once + canned error with [Try again]; DB failure → log+continue (post-delivery) or fail loud (pre-delivery).
+6. **Profile cache invalidation mandatory on writes.** ANY service writing to student_notes, student_profile, or student_skill_profile MUST DEL `profile:brief:{student_id}`.
+
+**Why:** During slice 2 verification, a UX bug surfaced (bot auto-serving questions after answers) that violated an unwritten design principle. Auditing for similar bugs revealed 25 issues, of which seven required immediate fixes in slice 2.5 and the rest got distributed across remaining slices or deferred to v1.5. The lesson: implicit principles need to be made explicit, or the AI implementing them will optimize the literal spec at the expense of felt experience.
+
+**Rejected alternatives:**
+- **Document principles only in slice prompts:** rejected because principles need to bind the architecture, not be re-litigated per slice. Each slice would re-derive (or worse, contradict) them.
+- **Treat each bug as a one-off fix:** rejected because the bugs share a pattern. Naming the underlying principles ensures future slices don't reintroduce equivalent bugs.
+
+**Tradeoffs accepted:**
+- Implementation now requires checking principles on every code change. Slight overhead for big payoff in consistency.
+- The principles add ~150 lines to service contracts. Worth it; they're the backbone of v5's "feels coherent" property.
+
+**Revisit when:** A new principle emerges that should be added (e.g., from real-user feedback). Treat additions as architecturally significant — log here, don't drop into a service contract section silently.
+
+---
+
+## 2026-04-25 — Slice 2.5 retrofit: seven fixes that should have been in slice 2
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5
+
+**Decision:** Slice 2's base implementation (6-tier retrieval + answer scoring + continuation buttons) is verified working. Before slice 3 begins, slice 2.5 retrofits seven fixes:
+
+1. **Skip button** on question keyboards (Bug 8)
+2. **Mid-question doubt detection** with back/skip/different-doubt buttons (Bug 1)
+3. **Close old keyboards** when serving new question (Bug 11, Principle 2)
+4. **Show my stats button** + `get_session_stats` function (Bug 12)
+5. **LLM API failure user-facing fallback** with `[Try again]` button (Bug 18)
+6. **DB write failure handling** per Principle 5 (Bug 19)
+7. **Webhook idempotency** via tg_update_id (Bug 20)
+
+**Why:** Each of these was caught during slice 2 architectural review. Fixes 1-4 are UX-breaking in slice 2's current form (Skip is missing, doubts mid-question abandon the question, old keyboards persist confusingly, no progress visibility). Fixes 5-7 are reliability foundations that subsequent slices will depend on. Retrofitting now costs less than retrofitting after slice 8.
+
+**Rejected alternatives:**
+- **Defer all 7 fixes to v1.5:** rejected because slices 3-8 will build on the broken base. Each slice would inherit the bugs, multiplying rework.
+- **Fix only the 4 UX bugs (1, 2, 3, 4) and defer reliability bugs (5, 6, 7):** rejected because reliability bugs have higher cost of late discovery (production incidents) than UX bugs (visible during testing).
+- **Spread fixes across slices 3-5:** rejected because it muddles slice scoping. Each slice should have a coherent theme; mixing slice 3's session work with slice 2's UX fixes makes both harder to verify.
+
+**Tradeoffs accepted:**
+- Adds ~5-7 hours of work between slices 2 and 3. Acceptable given the cost-of-deferral.
+- Two new migrations (011 skipped column, 012 tg_update_id index). Both append-only, idempotent.
+- The retrofit prompt is large (~250 lines). Manageable in a single Claude Code session.
+
+**Revisit when:** Verification reveals a fix didn't work or introduced regressions. Otherwise the retrofit is a clean slice and we don't revisit.
+
+---
+
+## 2026-04-25 — 17 of 25 architectural review bugs deferred to subsequent slices or v1.5
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5 architectural review
+
+**Decision:** Of 25 bugs caught during architectural review, 7 are addressed in slice 2.5 (above), 11 are addressed in subsequent slice prompts (3-8), and 7 are deferred to v1.5+.
+
+**Bugs distributed to slices 3-8 (incorporated into the slice prompts in 05_claude_code_prompts.md):**
+
+- **Bug 2 (Returning-after-break resume logic) → Slice 3:** When new session starts and previous session has unanswered work, orchestrator detects via `memory_service.detect_session_resume_candidate(student_id)` and VARC composes "want to resume?" response with [Resume] [Start fresh] [Just chat] buttons.
+- **Bug 4 (Real-time pattern detection within session) → Slice 8:** Mentor observer mode detects patterns inline; signals flow into AgentContext for the response that follows.
+- **Bug 6 (Onboarding pause option) → Slice 6:** During onboarding FSM, every prompt offers a [Pause for now] button. Tapping sets `student_profile.onboarding_paused_at`. Resumes from same step on next message.
+- **Bug 13 (Session-state cleared on boundary) → Slice 3:** Orchestrator's session boundary detection explicitly DELs `state:tg:{tg_id}` before creating new session state.
+- **Bug 14 (Profile cache invalidation hardening) → Slice 5:** Already enshrined as Principle 6; slice 5 is when it becomes operationally critical.
+- **Bug 15 (Mixed-intent secondary signal) → Slice 4:** Planner returns `intent.secondary_signal` for messages with both action and emotional tone (e.g., "I'm stressed, give me an easy one").
+- **Bug 22 (Granular subskill enum from planner) → Slice 4:** Planner prompt has the exact 12-subskill enum; VARC falls back to `inference_basic` if planner returns out-of-enum value.
+- **Bug 23 (Profile-derived default difficulty) → Slice 5:** `profile_service.get_default_difficulty(student_id)` derives from `preparation_stage`. Used when planner doesn't supply difficulty.
+- **Bug 24 (Post-onboarding session boundary) → Slice 6:** Onboarding session is closed when synthesis is sent. New session begins with next message; primary_agent inherited from button choice.
+- **Bug 25 (Empty-state fallback in profile brief) → Slice 5:** Tutor brief renders graceful fallbacks for new students with <5 questions, no recent sessions, etc.
+- **Bug 9 (Long-message chunking) → Slice 2.5 implementation note:** Orchestrator step 11 splits responses >3500 chars (passage as one message, question as second).
+
+**Bugs deferred to v1.5+ (logged here, not in any slice prompt):**
+
+- **Bug 3 (deeper) — Topic switch with paused contexts preserved:** Active session domain_state would track "paused contexts" — sets of questions abandoned mid-way. When student wants to resume after switching, the bot remembers. Defer because: shallow acknowledgment (slice 4) is sufficient for v1; deeper resume is nice-to-have.
+- **Bug 5 — Loading message timeout fallback:** If response takes >7 sec, edit "🤔 Thinking..." to "🤔 Still working..." Defer because: real latency observation in slices 4-5 will tell us if this matters.
+- **Bug 7 — Flow mode for power users:** After 5+ consecutive [Next question] taps, offer to enter "flow mode" where buttons are suppressed. Defer because: this is a v1.5 nice-to-have; v1's button overhead is manageable for first 50 users.
+- **Bug 10 — /feedback command:** Formal feedback channel. Defer because: ad-hoc feedback channels (DM the founder, GitHub issues) are sufficient for first 5-10 users.
+- **Bug 16 — Free text input during onboarding states:** Allow editing previous answers via free text during onboarding. Defer because: v1 onboarding can require taps; this is a nice-to-have.
+- **Bug 17 — Voice/image messages:** Currently rejected with friendly message. Real handling defer because: text-only is sufficient for VARC; voice/image is a different product surface.
+- **Bug 21 — Long-context within-session summarization:** When session has >30 turns, mini-summarize early turns. Defer because: typical sessions are <30 turns; this is a scaling concern, not a v1 concern.
+
+**Why these specific deferrals:**
+
+- The deferred bugs are nice-to-haves, scaling concerns, or features that don't break the core experience.
+- The slice-distributed bugs (3-8) are blocking for their respective slices but not blocking right now.
+- The slice-2.5 bugs are blocking right now (UX-breaking or reliability foundations).
+
+**Revisit when:** v1 ships and we have real-user data. Real-user feedback will likely re-prioritize: some deferred bugs may become urgent (e.g., if many users complain about button fatigue, Bug 7 jumps up); some may stay deferred forever (e.g., Bug 16 might prove unnecessary).
+
+**Tradeoffs accepted:**
+- Some deferred bugs may surface as user complaints in early testing. Acceptable; that's signal, not failure.
+- Maintaining the deferred-bugs list requires discipline. We commit to revisiting this DECISIONS entry every 4-6 weeks during early v1 operation.
+
+---
+
+## 2026-04-25 — v5.student_question_attempts replaces v4.attempts for v5 traffic
+
+**Status:** Decided
+**Slice / Phase:** Slice 2 implementation (logged retroactively)
+
+**Decision:** v5 introduces a fresh `v5.student_question_attempts` table for tracking question serves and answers. The v4 `public.attempts` table is left as-is, holding historical v4 data. v5 services do NOT write to `public.attempts`.
+
+This contradicts the original design doc plan (`01_data_model.md` originally said "Add session_id column to attempts"). The retroactive decision: don't touch v4 tables.
+
+**Why:** Modifying v4's schema during the v5 build risks v4 functionality (which we keep alive for rollback). A fresh v5 table:
+- Is truly append-only (no risk to v4)
+- Has fields v5 needs that v4 doesn't (skipped, is_diagnostic, fallback_tier)
+- Doesn't require backfilling historical data into a new column shape
+- After v4 is retired, v4.attempts can be archived or analyzed for historical signal; v5 owns the present
+
+**Rejected alternatives:**
+- **Add columns to public.attempts in v4:** rejected for v4-functionality risk and the strangler-fig discipline.
+- **Migrate public.attempts to v5.student_question_attempts:** rejected because backfilling fields v4 doesn't have (skipped, is_diagnostic, fallback_tier) creates fake data.
+- **Use one unified table for v4 + v5:** rejected because v4 and v5 have different semantics (v4 has trap analysis, v5 has tier info); merging adds complexity for no benefit.
+
+**Tradeoffs accepted:**
+- Two parallel attempts tables for the duration of v4's life. Both readable; both searchable for analytics. After v4 retirement, the historical v4.attempts can be archived or kept read-only.
+- Slight schema duplication. Acceptable.
+
+**Revisit when:** v4 is fully retired and we decide to consolidate.
+
+---
+
+## 2026-04-25 — Skip is "seen" but not "answered"
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5
+
+**Decision:** When a student taps [Skip / I don't know] on a question:
+- The attempt row gets `skipped = true`, `answered_at = now`, `is_correct = null`, `student_answer = null`, `explanation_shown = true`.
+- The student SEES the explanation (the same explanation they'd see for a wrong answer, minus the "you picked X" line).
+- The retrieval ladder considers this question "seen" — it won't be re-served via tier 1-4 (unseen tiers); only via tier 5 (stale-seen) or tier 6 (oldest-seen).
+- The skip does NOT count as a wrong answer for accuracy stats. It's its own category.
+
+**Why:** Skip respects the student's autonomy ("I don't want to guess; just teach me") while still giving them the educational value of the explanation. Treating skips as wrong answers would penalize honesty; treating them as "didn't see" would re-serve the same question, which feels punitive.
+
+**Rejected alternatives:**
+- **Skip = wrong answer:** rejected; penalizes honest "I don't know" responses, encouraging guessing.
+- **Skip = unseen (re-serve later):** rejected; punitive after the student already saw the explanation.
+- **Skip = no explanation shown:** rejected; misses the teaching opportunity. The student wants to learn from this question; they just don't want to guess.
+
+**Tradeoffs accepted:**
+- Stats need to track skip count separately (not in correct/wrong). Acceptable — `get_session_stats` reports it explicitly.
+- Some students might over-use Skip to avoid hard questions. Acceptable for v1; observable via session stats; intervention (mentor agent nudge: "noticed you've skipped 5 of 10 — want easier ones?") can land in slice 8 if we see this pattern.
+
+**Revisit when:** Real-user data shows skip-rate > 30% or pattern of avoidance. Currently we have no data; v1 ships and we observe.
+
+---
+
+## 2026-04-25 — Continuation button sets are deterministic, not LLM-generated
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5
+
+**Decision:** The buttons that appear after agent responses (continuation prompts, mentor strategic responses, mid-question doubt acks) are selected by orchestrator code, not by the LLM. Different button sets fire based on `response_type`, `intent.action`, and `intent.emotional_tone`.
+
+Examples:
+- After answer/skip explanation → `[Next question] [Different subskill] [I have a doubt] [I'm done]` (and `[Show my stats]` in slice 2.5+)
+- After mentor anxiety/frustration response → `[Try one easy one] [Different subskill] [Talk it out more] [Take a break]`
+- After mentor strategy response → `[Practice my weak areas] [Show my stats] [Ask another question] [I'm done]`
+- Mid-question doubt ack → `[Back to the question] [Skip this question] [Different question]`
+- Returning-after-break prompt → `[Resume that question] [Start fresh] [Just chat]`
+
+**Why:** LLM-generated buttons would be inconsistent (different wording every turn), unpredictable (occasionally missing key options), and hard to validate. Deterministic selection ensures every flow has the right options every time.
+
+The agents' LLM is told NOT to include questions, options, or buttons in their output — the system appends them.
+
+**Rejected alternatives:**
+- **LLM picks the buttons:** rejected for consistency reasons above.
+- **Single universal continuation button set:** rejected because context matters — the right buttons differ by emotional state, by whether a question is open, by whether the student just took a break.
+- **No buttons; pure free text:** rejected because button taps are faster on mobile and reduce friction.
+
+**Tradeoffs accepted:**
+- Button-set logic is in orchestrator code (~50 lines). Maintainable.
+- Adding new continuation contexts requires adding new button sets in code. Acceptable; rare.
+
+**Revisit when:** Real-user data shows consistent dead-ends (a context where no offered button matches what users want). Add the missing option.
+
+---
+
 <!-- 
 TEMPLATE FOR NEW ENTRIES — copy and fill:
 

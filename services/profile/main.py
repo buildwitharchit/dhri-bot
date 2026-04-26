@@ -4,7 +4,7 @@
 # Real assembly (notes, performance stats, episodic recall) lands in slice 5.
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from shared.db.client import db
 
@@ -43,3 +43,69 @@ async def get_minimal_brief(student_id: str) -> str:
 # Placeholder so callers in later slices can import the symbol now.
 async def get_tutor_brief(student_id: str) -> str:  # noqa: ARG001
     return await get_minimal_brief(student_id)
+
+
+# ─── Slice 2.5 / Fix 4: session stats ───────────────────────────────────────
+
+# Slice 3 introduces real session lifecycle; until then `session_id` is None
+# and we approximate "this session" with the last 60 minutes of activity.
+_SESSION_FALLBACK_WINDOW = "60 minutes"
+
+
+async def get_session_stats(student_id: str, session_id: Optional[str] = None) -> dict:
+    """Return aggregate stats for the student's current session.
+
+    Slice 2.5 contract: rolls up rows from v5.student_question_attempts in the
+    last 60 min. When slice 3 wires session_id through, the time-window
+    fallback is replaced with `WHERE session_id = $2::uuid`.
+    """
+    rows = await db.fetch(
+        f"""
+        SELECT a.is_correct, a.skipped, a.served_at, a.answered_at, q.subskill
+        FROM v5.student_question_attempts a
+        LEFT JOIN public.questions q ON q.question_id = a.question_id
+        WHERE a.student_id = $1::uuid
+          AND a.served_at > now() - interval '{_SESSION_FALLBACK_WINDOW}'
+        ORDER BY a.served_at ASC
+        """,
+        student_id,
+    )
+
+    if not rows:
+        return {
+            "attempted": 0,
+            "correct": 0,
+            "skipped": 0,
+            "accuracy_pct": 0,
+            "top_subskills": [],
+            "duration_min": 0,
+        }
+
+    answered_rows = [r for r in rows if r["is_correct"] is not None]
+    skipped_rows = [r for r in rows if r["skipped"]]
+    correct_rows = [r for r in rows if r["is_correct"] is True]
+
+    attempted = len(answered_rows)
+    skipped = len(skipped_rows)
+    correct = len(correct_rows)
+    accuracy_pct = round(correct * 100 / attempted) if attempted else 0
+
+    counter: dict[str, int] = {}
+    for r in rows:
+        sk = r["subskill"]
+        if sk:
+            counter[sk] = counter.get(sk, 0) + 1
+    top_subskills = sorted(counter, key=lambda k: counter[k], reverse=True)[:3]
+
+    earliest = min(r["served_at"] for r in rows)
+    latest = max((r["answered_at"] or r["served_at"]) for r in rows)
+    duration_min = max(1, int((latest - earliest).total_seconds() / 60))
+
+    return {
+        "attempted": attempted,
+        "correct": correct,
+        "skipped": skipped,
+        "accuracy_pct": accuracy_pct,
+        "top_subskills": top_subskills,
+        "duration_min": duration_min,
+    }

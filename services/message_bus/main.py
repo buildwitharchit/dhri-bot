@@ -1,23 +1,29 @@
 # services/message_bus/main.py
 #
 # Thin Telegram boundary for v5.
-#   1. Parse the raw Update payload.
+#   1. Parse the raw Update payload (now also extracts update_id for Fix 7).
 #   2. Send "🤔 Thinking..." (capture message_id).
 #   3. Refresh chatAction("typing") every 4s while orchestrator runs.
-#   4. editMessageText on completion (fall back to send if edit fails).
+#   4. Close the previous question's inline keyboard if requires_keyboard_close
+#      is set on the response (Fix 3 / Principle 2).
+#   5. editMessageText on completion (fall back to send if edit fails).
+#   6. If the response served a new question, persist the delivered message_id
+#      and attempt_id into Redis active session state (Fix 3 / Principle 2).
 #
-# No DB / Redis writes. No business logic. The orchestrator owns identity,
-# routing, persistence — bus is pure platform translation.
+# Bus owns: Telegram I/O + the post-delivery state-write coupling that
+# Principle 2 needs. No DB writes, no business logic.
 
 import asyncio
 import logging
 from typing import Any, Optional
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
 from services.orchestrator.main import handle_message
+from shared.redis.client import update_state
+from shared.telegram.utils import edit_telegram_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +59,10 @@ async def handle_telegram_update(update: dict, bot: Bot) -> None:
         )
     except Exception:
         logger.exception("v5 bus: orchestrator raised; sending generic error")
-        response = {"content": "Something went wrong — try again in a moment.",
-                    "keyboard": None}
+        response = {
+            "content": "Something went wrong — try again in a moment.",
+            "keyboard": None,
+        }
     finally:
         typing_task.cancel()
         try:
@@ -62,14 +70,37 @@ async def handle_telegram_update(update: dict, bot: Bot) -> None:
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
 
-    await _deliver(bot, chat_id, thinking_message_id, response)
+    # Fix 3 / Principle 2: close prior question's keyboard before serving new.
+    if response.get("requires_keyboard_close"):
+        prev_msg_id = (response.get("meta") or {}).get("previous_question_message_id")
+        if prev_msg_id:
+            await edit_telegram_keyboard(bot, chat_id, prev_msg_id, None)
+
+    delivered_message_id = await _deliver(bot, chat_id, thinking_message_id, response)
+
+    # Fix 3 / Principle 2: persist the new question's tg_message_id so the
+    # next question_serve can close it.
+    track_attempt_id = response.get("track_question_attempt_id")
+    if track_attempt_id and delivered_message_id is not None:
+        try:
+            await update_state(
+                parsed["tg_id"],
+                last_question_message_id=delivered_message_id,
+                last_question_attempt_id=track_attempt_id,
+            )
+        except Exception:
+            logger.exception(
+                "v5 bus: failed to persist active-session state tg_id=%s", parsed["tg_id"],
+            )
 
 
 # ─── parsing ────────────────────────────────────────────────────────────────
 
 
 def _parse(update: dict) -> Optional[dict]:
-    """Normalize the Telegram Update into the slice-1 payload shape."""
+    """Normalize the Telegram Update into the v5 payload shape."""
+    update_id = update.get("update_id")
+
     if "callback_query" in update:
         cq = update["callback_query"]
         msg = cq.get("message") or {}
@@ -80,6 +111,7 @@ def _parse(update: dict) -> Optional[dict]:
             "content": cq.get("data", ""),
             "content_type": "button",
             "source_metadata": {
+                "tg_update_id": update_id,
                 "tg_chat_id": chat.get("id"),
                 "tg_callback_query_id": cq.get("id"),
                 "first_name": cq["from"].get("first_name"),
@@ -91,7 +123,7 @@ def _parse(update: dict) -> Optional[dict]:
         return None
     text = (msg.get("text") or "").strip()
     if not text:
-        # voice / photo / sticker — slice-1 declines gracefully via direct reply elsewhere
+        # voice / photo / sticker — declined silently in slice 2.5
         return None
     chat = msg.get("chat") or {}
     return {
@@ -100,6 +132,7 @@ def _parse(update: dict) -> Optional[dict]:
         "content": text,
         "content_type": "text",
         "source_metadata": {
+            "tg_update_id": update_id,
             "tg_message_id": msg.get("message_id"),
             "tg_chat_id": chat.get("id"),
             "first_name": msg["from"].get("first_name"),
@@ -128,27 +161,34 @@ async def _deliver(
     chat_id: int,
     thinking_message_id: int,
     response: dict,
-) -> None:
+) -> Optional[int]:
+    """Edit the thinking message in place. Returns the delivered message_id
+    (so the caller can stash it for keyboard-close coordination)."""
     text = response.get("content") or "(no content)"
     if len(text) > TELEGRAM_MAX_CHARS:
         text = text[: TELEGRAM_MAX_CHARS - 1] + "…"
     reply_markup = _build_reply_markup(response.get("keyboard"))
 
     try:
-        await bot.edit_message_text(
+        edited = await bot.edit_message_text(
             chat_id=chat_id,
             message_id=thinking_message_id,
             text=text,
             reply_markup=reply_markup,
         )
-        return
+        # editMessageText returns the edited Message object on text edits.
+        return getattr(edited, "message_id", thinking_message_id)
     except TelegramError as e:
         logger.warning("v5 bus: edit failed (%s); falling back to new message", e)
 
     try:
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        sent = await bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup,
+        )
+        return sent.message_id
     except TelegramError as e:
         logger.error("v5 bus: send fallback also failed: %s", e)
+        return None
 
 
 # ─── typing refresh ─────────────────────────────────────────────────────────

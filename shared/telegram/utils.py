@@ -138,6 +138,33 @@ _ERROR_MESSAGES = {
 }
 
 
+async def edit_telegram_keyboard(
+    bot,
+    chat_id: int,
+    message_id: int,
+    new_keyboard: Optional[InlineKeyboardMarkup] = None,
+) -> bool:
+    """editMessageReplyMarkup. Pass new_keyboard=None to clear the inline keyboard.
+
+    Used by the v5 message bus to enforce Principle 2 (close old keyboards
+    when a new question is served). Never raises — returns False on failure
+    so the caller can log and continue.
+    """
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=new_keyboard,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "edit_telegram_keyboard failed chat_id=%s message_id=%s: %s",
+            chat_id, message_id, e,
+        )
+        return False
+
+
 async def send_error_to_update(update, error_key: str, bot) -> None:
     text = _ERROR_MESSAGES.get(error_key, _ERROR_MESSAGES["generic"])
     chat_id = None

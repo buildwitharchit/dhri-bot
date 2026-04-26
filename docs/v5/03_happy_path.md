@@ -4,6 +4,34 @@
 
 This document traces specific user interactions through every service. It validates that the data model and service contracts compose into working behavior. If a trace doesn't make sense, the architecture has a gap.
 
+**⚠️ Slice 2.5 update note (2026-04-25):**
+
+The 5 original traces below were written before slice 2.5's architectural updates. The original traces show the bot auto-serving questions after answers (line "Step 23: VARC serves next question") — **THIS IS NO LONGER CORRECT.** Per Principle 1 (no auto-serve), the bot now ends every answer-explanation with continuation buttons and waits for the student's next message.
+
+When reading the original traces, mentally substitute:
+- "Step 22: VARC composes explanation + auto-serves next question" → "Step 22: VARC composes explanation + 4 continuation buttons. STOP. Wait for next user message."
+- Any "auto-served next question" pattern → "continuation buttons + wait for tap"
+
+Other slice 2.5 changes that affect every trace:
+- Question keyboards now have a Skip button (Row 2: `[Skip / I don't know]`)
+- New question serves close the previous question's keyboard via `editMessageReplyMarkup`
+- Webhook idempotency check (Step 0) runs before any other processing
+- LLM/DB failures show graceful fallbacks with `[Try again]` button
+- Active session Redis state cleared on session boundary
+
+**5 NEW traces are appended at the end of this document** showing:
+- Trace 6: Skip flow
+- Trace 7: Mid-question doubt
+- Trace 8: Returning after break with resume
+- Trace 9: Mid-session stats request
+- Trace 10: LLM API failure with retry
+
+These new traces fully reflect slice 2.5's architecture. When a discrepancy exists between original traces (1-5) and the contracts in `02_service_contracts.md`, **trust the contracts.**
+
+---
+
+## Original Traces (1-5)
+
 Five traces are documented, in order of importance:
 
 1. **First-time user (onboarding flow)** — most critical to get right
@@ -1191,6 +1219,636 @@ For implementation: build error handling for each.
 | Bus delivery | Telegram API fails | Retry once; user may not see response |
 
 The principle: **never crash the user-facing flow, even at the cost of some state inconsistency**. Better to send a response and have a state hiccup than to crash.
+
+---
+
+# NEW TRACES (Slice 2.5 architecture)
+
+The five traces below reflect slice 2.5's updated architecture with continuation buttons, skip flow, mid-question doubt handling, returning-after-break, and graceful failure modes.
+
+---
+
+## Trace 6: Skip Flow
+
+### Scenario
+
+Archit gets a question. He doesn't know the answer and doesn't want to guess. He taps `[Skip / I don't know]`.
+
+This validates Bug 8 fix from slice 2.5.
+
+### Pre-state
+
+- Active session: yes
+- Active question: passage P, question Q1, attempt_id `att-uuid-1`, served 30 seconds ago
+- domain_state.current_question_id = Q1
+- last_question_attempt_id = att-uuid-1 in Redis active session
+
+### Step 1: User taps Skip button
+
+Telegram sends webhook with `callback_query`:
+- callback_data = `v5_skip_att-uuid-1`
+- message reply markup intact (button taps don't auto-clear)
+
+### Steps 0-5: Standard processing
+
+- Step 0 (idempotency): tg_update_id is new, proceed
+- Step 1 (lock): acquired
+- Step 2 (persist user message): content = "[Button tap: Skip / I don't know]", content_type = "button", tg_update_id = update_id
+
+### Step 6.5: Deterministic detection (Bug 8)
+
+Orchestrator sees callback_data starts with `v5_skip_`:
+- Override `intent.action = "skip_request"`
+- Set `context.skipped_attempt_id = att-uuid-1`
+- Skip planner LLM call (deterministic override)
+
+### Step 8-9: Context (no profile fetch needed for skip)
+
+- AgentContext built with skipped_attempt_id, current_unanswered_attempt loaded from active session domain_state
+- intent.action = "skip_request"
+
+### Step 10: VARC handles skip_request
+
+```python
+# Pseudo-code
+def handle_skip_request(context):
+    attempt = context.current_unanswered_attempt  # row for att-uuid-1
+    question = fetch_question(attempt.question_id)
+    
+    # Compose explanation prompt — slightly different from answer flow
+    # Key difference: NO "you picked X" line; tone is teaching, not corrective
+    prompt = f"""
+    The student tapped Skip on this question. Show them what was happening with it.
+    
+    Question: {question.text}
+    Options: {question.options}
+    Correct answer: {question.correct_letter}
+    
+    Compose:
+    1. Brief acknowledgment ("No worries — here's what was happening with that one:")
+    2. Explanation of correct answer + why each wrong option is wrong
+    3. Brief 'what next' transition line ("Want to try another, or shift gears?")
+    
+    Do NOT include a new question or A/B/C/D options.
+    """
+    
+    response_text = MODEL_VARC_TUTOR.complete(prompt)
+    
+    return AgentResponse(
+        content=response_text,
+        keyboard_buttons=[
+            [{"text": "Next question", "callback_data": "v5_continue_next"},
+             {"text": "Different subskill", "callback_data": "v5_continue_switch_subskill"}],
+            [{"text": "Show my stats", "callback_data": "v5_continue_stats"},
+             {"text": "I have a doubt", "callback_data": "v5_continue_doubt"},
+             {"text": "I'm done", "callback_data": "v5_continue_done"}]
+        ],
+        response_type="skip_explanation",
+        requires_keyboard_close=False,  # original question's keyboard stays (student already saw it)
+        memory_deltas={
+            "attempt_record": {
+                "operation": "update",
+                "data": {
+                    "id": "att-uuid-1",
+                    "answered_at": now(),
+                    "is_correct": None,         # null because skipped
+                    "student_answer": None,     # null because skipped
+                    "skipped": True,
+                    "explanation_shown": True
+                }
+            },
+            "active_context_updates": {
+                "domain_state.current_question_id": None,  # this question is closed for the student
+                "last_question_attempt_id": None
+            }
+        },
+        meta={...}
+    )
+```
+
+### Step 13: Orchestrator commits memory deltas
+
+- UPDATE v5.student_question_attempts WHERE id = 'att-uuid-1':
+  - answered_at = now()
+  - is_correct = NULL (skipped doesn't count as wrong)
+  - student_answer = NULL
+  - skipped = TRUE
+  - explanation_shown = TRUE
+- Active session Redis updated: last_question_attempt_id cleared (no open question)
+
+### User sees
+
+```
+No worries — here's what was happening with that one:
+
+Correct answer: B
+Why: ...
+[teaching content]
+
+Want to try another, or shift gears?
+
+[Next question]  [Different subskill]
+[Show my stats]  [I have a doubt]  [I'm done]
+```
+
+### Validation
+
+```sql
+-- The attempt row reflects the skip
+SELECT skipped, answered_at, is_correct, student_answer, explanation_shown
+FROM v5.student_question_attempts WHERE id = 'att-uuid-1';
+-- skipped=TRUE, answered_at=<recent>, is_correct=NULL, student_answer=NULL, explanation_shown=TRUE
+
+-- The retrieval ladder will now consider this question "seen"
+-- (so it won't be re-served via tier 1-4; only tier 5/6 fallback)
+```
+
+### Why this is correct
+
+- Skip is "I saw it but didn't want to guess" — student deserves the explanation, but no correctness counted
+- The retrieval ladder respects skips ("seen" but not "answered") so the question won't be force-served again
+- Continuation buttons let the student decide what's next (Principle 1)
+
+---
+
+## Trace 7: Mid-Question Doubt
+
+### Scenario
+
+Archit is shown a question. Before answering, he types: "what does 'incommensurable' mean in option B?"
+
+He has an open question, but his message isn't an answer (no A/B/C/D regex match). It's a free text question while a question is active.
+
+This validates Bug 1 fix from slice 2.5.
+
+### Pre-state
+
+- Active session: yes
+- Open attempt: att-uuid-2, question Q2, served 45 seconds ago
+- Question Q2's keyboard still active in chat history
+
+### Steps 0-2: Standard
+
+- update_id new, lock acquired, message persisted with content_type='text'
+
+### Step 6.5: Deterministic detection (Bug 1)
+
+Orchestrator runs the mid-question doubt check:
+- Active session has `last_question_attempt_id = att-uuid-2` (an unanswered attempt)
+- content_type == "text" (not button callback)
+- content does NOT match answer regex (`^[ABCDabcd1234]\s*$`, etc)
+- → Override `intent.action = "doubt_about_current"`
+- → Set `context.mid_question_doubt = true`
+- → Set `context.current_unanswered_attempt = <att-uuid-2 row>`
+- Skip planner LLM (deterministic override)
+
+### Step 10: VARC handles doubt_about_current (mid-question case)
+
+In slice 2.5, this is hardcoded — no LLM call:
+
+```python
+def handle_mid_question_doubt(context):
+    attempt = context.current_unanswered_attempt
+    
+    return AgentResponse(
+        content="Got it — I'll come back to that. First, let's finish the current question or skip it. What works?",
+        keyboard_buttons=[
+            [{"text": "Back to the question", "callback_data": f"v5_show_question_{attempt.id}"}],
+            [{"text": "Skip this question", "callback_data": f"v5_skip_{attempt.id}"},
+             {"text": "I have a different question", "callback_data": "v5_continue_doubt"}]
+        ],
+        response_type="mid_question_doubt_ack",
+        requires_keyboard_close=False,  # original question's keyboard stays valid
+        memory_deltas={
+            "active_context_updates": {}  # NO updates to attempt row — still unanswered intentionally
+        },
+        meta={"agent": "varc", "model_used": None, "cost_usd": 0.0, ...}
+    )
+```
+
+### Step 13: Memory deltas
+
+- NO update to v5.student_question_attempts (the attempt is intentionally still open)
+- Active session Redis state unchanged (still has last_question_attempt_id = att-uuid-2)
+
+### User sees
+
+```
+[Original question still visible above with A/B/C/D buttons]
+[New message:]
+
+Got it — I'll come back to that. First, let's finish the current question or skip it. What works?
+
+[Back to the question]
+[Skip this question]  [I have a different question]
+```
+
+### Step 19: User taps [Back to the question]
+
+- callback_data = `v5_show_question_att-uuid-2`
+- Step 6.5 detects this:
+  - Look up the attempt and its question
+  - Re-render the question presentation (same passage + question + A/B/C/D + Skip keyboard)
+  - response_type = "question_serve" (re-served)
+  - requires_keyboard_close = false (we're showing the same question again)
+  - DO NOT insert a new attempts row — the existing one is still valid
+
+User sees the question again. Original question above (with intact A/B/C/D buttons) is still tappable. The student can answer either copy.
+
+### Alternative: User taps [I have a different question]
+
+- callback_data = `v5_continue_doubt`
+- Orchestrator composes: "Got it, what's your question?" + 1 button `[Back to current question]`
+- response_type = "mid_question_doubt_ack"
+- Free text from student after this is handled by future slice 4 planner; in slice 2.5, just routes as practice_request
+
+### Validation
+
+```sql
+-- The original attempt is still open (no leak from doubt handling)
+SELECT answered_at, skipped FROM v5.student_question_attempts WHERE id = 'att-uuid-2';
+-- answered_at=NULL, skipped=FALSE
+
+-- Three messages exist for this turn:
+-- 1. user message: "what does 'incommensurable' mean in option B?"
+-- 2. assistant message: the doubt-ack response
+-- (3. assistant message after [Back to question] tap: re-render of question)
+```
+
+### Why this is correct
+
+- Student's autonomy preserved: they get to ask doubts mid-question without losing the question
+- Original question's keyboard stays valid (`requires_keyboard_close=false`)
+- The choice is explicit: come back, skip, or pursue the doubt
+- No domain_state corruption: the open attempt remains open
+- Slice 4 will replace the hardcoded ack with an LLM-driven response that actually attempts to address the doubt; slice 2.5 just acknowledges and offers the buttons
+
+---
+
+## Trace 8: Returning After Break (with Resume)
+
+### Scenario
+
+Archit had a session yesterday. He was on inference question Q42, didn't answer, life got busy. Today he comes back and types "hi".
+
+This validates Bug 2 fix.
+
+### Pre-state
+
+- Last session: ended 18 hours ago (`ended_at = '2026-04-24T16:00:00Z'`, `end_reason = 'inactivity_timeout'`)
+- Last session had unanswered attempt: att-uuid-old, question Q42, subskill='inference_basic', `answered_at IS NULL AND skipped = FALSE`
+- Episodic summary exists from session-end pipeline: "Worked on inference, scored 4/6, struggled with out-of-scope traps."
+- No active session in Redis
+
+### Step 1-2: Standard
+
+- Lock acquired
+- User message "hi" persisted
+
+### Step 5: Session boundary detection
+
+- Read `state:tg:{tg_id}` from Redis → empty (was cleared at session close)
+- Check Postgres for most recent session → found, ended_at set 18 hours ago → no active session
+- This is a session boundary (in fact, the start of a new session after a break)
+- Create new session row in v5.sessions
+- Set new state:tg:{tg_id} in Redis (Principle 3: previous state was already cleared on session close)
+
+**Returning-after-break detection (Bug 2):**
+
+```python
+candidate = memory_service.detect_session_resume_candidate(student_id)
+
+# detect_session_resume_candidate runs:
+# SELECT most recent ended session (yesterday's)
+# Check for unanswered, non-skipped attempts → finds att-uuid-old with Q42
+# Check days_since_break <= 14 → 18 hours = 0.75 days, OK
+# Returns:
+candidate = {
+    "previous_session_id": "sess-uuid-old",
+    "previous_session_ended_at": "2026-04-24T16:00:00Z",
+    "days_since_break": 0,  # rounded down from 0.75
+    "last_question_id": "Q42",
+    "last_question_subskill": "inference_basic",
+    "last_session_summary": "Worked on inference, scored 4/6, struggled with out-of-scope traps."
+}
+
+context.session_resume_candidate = candidate
+```
+
+### Step 6: Planner classifies
+
+```json
+{
+  "intent": {
+    "domain": "varc",
+    "action": "casual",  // or "small_talk" — "hi" is ambiguous
+    "continuation": "new_session",
+    "emotional_tone": "neutral",
+    "depth": "quick_query",
+    "references_past": "none"
+  }
+}
+```
+
+### Step 10: VARC handles, but special-cased on session_resume_candidate
+
+In VARC's handle:
+
+```python
+if context.session_resume_candidate and intent.action in ("casual", "small_talk", "practice_request", ...):
+    # The returning-after-break override
+    candidate = context.session_resume_candidate
+    
+    prompt = f"""
+    The student is returning after a {candidate.days_since_break} day break. 
+    Last session: {candidate.last_session_summary}
+    Specifically, they had an unanswered {candidate.last_question_subskill} question still open.
+    
+    Compose a warm welcome (2 sentences) that:
+    - Acknowledges the return
+    - Offers to either pick up the unfinished question or start fresh
+    
+    End with a transition line. Buttons added by system.
+    """
+    
+    response_text = MODEL_VARC_TUTOR.complete(prompt)  # or Sonnet for warmth
+    
+    return AgentResponse(
+        content=response_text,
+        keyboard_buttons=[
+            [{"text": "Resume that question", "callback_data": f"v5_resume_{candidate.last_question_id}"},
+             {"text": "Start fresh", "callback_data": "v5_continue_next"}],
+            [{"text": "Just chat first", "callback_data": "v5_continue_doubt"}]
+        ],
+        response_type="session_resume_prompt",
+        requires_keyboard_close=False,
+        memory_deltas={"new_assistant_turn": {...}, "active_context_updates": {}},
+        meta={...}
+    )
+```
+
+### User sees
+
+```
+Welcome back. Last time we were on an inference question — you were working through it 
+when you stepped away. Want to pick that one up, or start fresh?
+
+[Resume that question]  [Start fresh]
+[Just chat first]
+```
+
+### Step 19: User taps [Resume that question]
+
+- callback_data = `v5_resume_Q42`
+- Step 6.5 detects: route to VARC with intent.action = "practice_request" + context override `resume_question_id = Q42`
+- VARC re-serves Q42:
+  - Insert NEW attempt row for the new session (att-uuid-new) with question_id = Q42
+  - Mark fallback_tier = 1 (specific resume, not a fallback fetch)
+  - Note: the OLD attempt (att-uuid-old) stays open in the closed session forever, never answered. Acceptable; just analytics noise.
+- Continue normally
+
+### Alternative: User taps [Start fresh]
+
+- callback_data = `v5_continue_next`
+- Standard practice_request flow → VARC retrieves next via 6-tier ladder
+- Insert observer event "resume_declined" for analytics
+
+### Why this is correct
+
+- Bot remembers what was being worked on across sessions (wow moment 2)
+- Student has choice — not forced to resume
+- Old unanswered attempt is preserved (analytics) but not held open in current session
+- New session starts cleanly per Principle 3
+
+---
+
+## Trace 9: Mid-Session Stats Request
+
+### Scenario
+
+Archit has answered 4 questions in this session. After getting an explanation, he taps `[Show my stats]` to see how he's doing.
+
+This validates Bug 12 fix.
+
+### Pre-state
+
+- Active session: yes, message_count = 9, ~4 questions answered
+- v5.student_question_attempts has 4 rows for this session: 3 correct, 1 wrong, 0 skipped
+- 2 subskills practiced: inference_basic (3 attempts, 2 correct), specific_detail (1 attempt, 1 correct)
+
+### Step 1: User taps Show my stats
+
+- callback_data = `v5_continue_stats`
+
+### Step 6.5: Deterministic detection
+
+- callback prefix `v5_continue_` matched
+- Action = `stats` → `intent.action = "stats_request"`
+
+### Step 9: Context loaded (minimal)
+
+- `context.session_stats = profile_service.get_session_stats(student_id, session_id)`
+- Pure SQL, no LLM, ~30ms
+
+### Step 10: Orchestrator handles directly (NO agent invocation, Bug 12)
+
+```python
+if intent.action == "stats_request":
+    stats = context.session_stats
+    
+    response_text = (
+        f"**This session so far:**\n"
+        f"- Attempted: {stats['attempted']}, Correct: {stats['correct']}, "
+        f"Skipped: {stats['skipped']}\n"
+        f"- Accuracy: {stats['accuracy_pct']}%\n"
+    )
+    
+    if stats['subskill_breakdown']:
+        response_text += "- Subskills:\n"
+        for subskill, sub_stats in stats['subskill_breakdown'].items():
+            response_text += f"  - {subskill}: {sub_stats['correct']}/{sub_stats['attempted']} ({sub_stats['accuracy']}%)\n"
+    
+    if stats.get('trap_pattern'):
+        response_text += f"- Most common trap: {stats['trap_pattern']}\n"
+    
+    response_text += f"- Time: {stats['duration_seconds'] // 60} min"
+    
+    return AgentResponse(
+        content=response_text,
+        keyboard_buttons=[
+            [{"text": "Next question", "callback_data": "v5_continue_next"},
+             {"text": "Different subskill", "callback_data": "v5_continue_switch_subskill"}],
+            [{"text": "I have a doubt", "callback_data": "v5_continue_doubt"},
+             {"text": "I'm done", "callback_data": "v5_continue_done"}]
+        ],
+        response_type="session_stats",
+        requires_keyboard_close=False,
+        memory_deltas={"new_assistant_turn": {...}, "active_context_updates": {}},
+        meta={"agent": "orchestrator", "model_used": None, "cost_usd": 0.0, ...}
+    )
+```
+
+### User sees
+
+```
+This session so far:
+- Attempted: 4, Correct: 3, Skipped: 0
+- Accuracy: 75%
+- Subskills:
+  - inference_basic: 2/3 (67%)
+  - specific_detail: 1/1 (100%)
+- Time: 12 min
+
+[Next question]  [Different subskill]
+[I have a doubt]  [I'm done]
+```
+
+### Validation
+
+```sql
+-- The stats response is persisted as assistant message
+SELECT content, metadata->>'response_type' FROM v5.messages 
+WHERE student_id = 'your-uuid' ORDER BY created_at DESC LIMIT 1;
+-- content has the stats text, response_type = 'session_stats'
+
+-- No LLM call recorded (orchestrator-composed, no LLM)
+SELECT count(*) FROM v5.llm_calls 
+WHERE student_id = 'your-uuid' AND created_at > now() - interval '1 minute';
+-- 0 (or 1 if planner ran; but stats_request was detected deterministically before planner in this case)
+```
+
+### Why this is correct
+
+- Cheap (pure SQL, no LLM) — slice 5 will introduce LLM calls only where they add value
+- Latency excellent (~50ms total)
+- Continuation buttons keep flow going (Principle 1)
+- The stats text is templated for predictability; LLM-driven would be inconsistent
+
+---
+
+## Trace 10: LLM API Failure with Retry
+
+### Scenario
+
+Archit asks for a question. OpenRouter is having issues — VARC's LLM call fails.
+
+This validates Bug 18 fix from slice 2.5 + Principle 5.
+
+### Pre-state
+
+- Active session: yes
+- OpenRouter is down (or rate-limited, or returning 500s)
+
+### Steps 0-9: Standard until VARC is invoked
+
+### Step 10: VARC handle, attempts LLM call
+
+```python
+async def handle_practice_request(context):
+    question, tier = await retrieve_question(...)  # this works (no LLM)
+    
+    prompt = build_presentation_prompt(question)
+    
+    try:
+        response_text = await openrouter.chat(model=MODEL_VARC_TUTOR, prompt=prompt)
+    except (TimeoutError, APIError) as e:
+        log.error(f"LLM call failed: {e}")
+        
+        # Retry once
+        try:
+            await asyncio.sleep(0.5)
+            response_text = await openrouter.chat(model=MODEL_VARC_TUTOR, prompt=prompt)
+        except (TimeoutError, APIError) as e2:
+            log.error(f"LLM call failed after retry: {e2}")
+            
+            # Graceful fallback (Principle 5)
+            return AgentResponse(
+                content="Hmm, having trouble thinking right now. Try again in a moment?",
+                keyboard_buttons=[
+                    [{"text": "Try again", "callback_data": "v5_retry"}]
+                ],
+                response_type="error_fallback",
+                requires_keyboard_close=False,  # the previously-served question's keyboard (if any) stays valid
+                memory_deltas={
+                    "new_assistant_turn": {...},
+                    "active_context_updates": {}  # NO updates — state stays consistent for clean retry
+                },
+                observer_events=[
+                    {"event_type": "llm_failure", "payload": {
+                        "service": "varc",
+                        "model": MODEL_VARC_TUTOR,
+                        "error": str(e2),
+                        "retry_attempted": True
+                    }}
+                ],
+                meta={
+                    "agent": "varc",
+                    "model_used": None,  # null because no successful call
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": 0.0,
+                    "generation_latency_ms": ...,  # how long retries took
+                    "response_type": "error_fallback"
+                }
+            )
+```
+
+### Step 13: Memory deltas applied
+
+- new_assistant_turn persisted (the canned error message)
+- active_context_updates is empty — domain_state stays as-is, attempt row not modified
+- observer_event 'llm_failure' inserted (for monitoring / dashboards)
+
+### User sees
+
+```
+Hmm, having trouble thinking right now. Try again in a moment?
+
+[Try again]
+```
+
+### Step 19: User taps Try again
+
+- callback_data = `v5_retry`
+- Step 6.5 detects: 
+  - Load the previous user message (the one that triggered the failed flow)
+  - Use its `metadata.intent_classification` to retrieve the original intent
+  - Set `context.retry_context = {"retrying": true, "original_intent": <recovered_intent>}`
+- Re-runs the same flow with same intent
+- If OpenRouter is back up: VARC composes successfully, user sees their question
+- If still down: another error_fallback response (acceptable; user can keep trying or come back later)
+
+### Validation
+
+```sql
+-- The error fallback was persisted as an assistant message
+SELECT content, metadata->>'response_type', metadata->>'cost_usd'
+FROM v5.messages 
+WHERE student_id = 'your-uuid' ORDER BY created_at DESC LIMIT 1;
+-- content has the error message, response_type='error_fallback', cost_usd=0.0
+
+-- An observer event was logged
+SELECT * FROM v5.observer_events 
+WHERE student_id = 'your-uuid' AND event_type = 'llm_failure' 
+ORDER BY created_at DESC LIMIT 1;
+-- 1 row, payload has model + error details
+
+-- llm_calls has the failed call(s) logged with success=false (slice 3+)
+SELECT model, success, error_message FROM v5.llm_calls
+WHERE student_id = 'your-uuid' AND success = FALSE
+ORDER BY created_at DESC LIMIT 5;
+-- 2 rows (initial + retry), success=false on both
+```
+
+### Why this is correct
+
+- User experience is preserved: a clear fallback message, not a crash or silence
+- State is clean: no half-modified domain_state, no half-recorded attempts
+- Retry mechanism is explicit: button click, not automatic
+- Observability: failures are logged to v5.llm_calls + observer_events for monitoring
+- The retry uses the original intent (not re-classified), so a transient outage doesn't accidentally change what the user gets
+
+This pattern applies to any LLM-bearing service (planner, VARC, Mentor, extractor). Each service implements the same retry-once-then-fallback pattern.
 
 ---
 

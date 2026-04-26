@@ -6,7 +6,9 @@ dhri v5 is built in **thin vertical slices**. Each slice ships a working end-to-
 
 This is the opposite of horizontal layering ("build all of memory service, then all of profile service..."), which is what produced v4's broken-feeling result. With slices, the system always works at every checkpoint — just less smartly than the final version.
 
-The 8 slices below are designed to be implemented in **a single Claude Code session**. Each slice has clear scope, manual tests, and completion criteria. The session can take 1-3 days depending on how cleanly it goes.
+The 9 slices below (8 + a retrofit slice) are designed to be implemented across a few Claude Code sessions. Each slice has clear scope, manual tests, and completion criteria.
+
+**Slice 2.5** was added after slice 2 verification, when an architectural review surfaced 25 issues. Seven of those needed retroactive code fixes to slice 2; eleven were distributed into slices 3-8 prompts; seven were deferred to v1.5+. See `DECISIONS.md` for the catalog and rationale.
 
 ---
 
@@ -15,17 +17,29 @@ The 8 slices below are designed to be implemented in **a single Claude Code sess
 | Slice | Goal | Time est | Key capability added |
 |-------|------|----------|----------------------|
 | 1 | Skeleton | 2-3h | All services exist, end-to-end flow works |
-| 2 | Real retrieval | 2-3h | VARC retrieves real questions |
-| 3 | Working memory + sessions | 2-3h | Conversation continuity within sessions |
-| 4 | Planner + guardrails | 3-4h | Intent-driven routing, out-of-scope handling |
-| 5 | Profile reads | 2-3h | Personalized responses |
-| 6 | Onboarding FSM | 3-4h | Full new-user flow |
-| 7 | Session-end + extraction | 3-4h | Episodic memory + profile growth |
-| 8 | Mentor + observer | 2-3h | Cross-domain reactive + pattern detection |
+| 2 | Real retrieval | 2-3h | VARC retrieves real questions, scoring works |
+| **2.5** | **Retrofit fixes** | **3-5h** | **Skip button, mid-question doubts, close keyboards, stats, error fallbacks, idempotency** |
+| 3 | Working memory + sessions | 3-4h | LLM explanations, session lifecycle, returning-after-break |
+| 4 | Planner + guardrails | 3-4h | Intent-driven routing, small_talk distinction, out-of-scope |
+| 5 | Profile reads | 2-3h | Personalized responses, default difficulty, empty-state fallbacks |
+| 6 | Onboarding FSM | 3-4h | New-user flow with pause option + diagnostic + synthesis |
+| 7 | Session-end + extraction | 3-4h | Episodic memory + profile note growth |
+| 8 | Mentor + observer | 3-4h | Strategic responses + real-time pattern detection |
 
-**Total estimated time: 19-28 hours** of focused implementation.
+**Total estimated time: 24-33 hours** of focused implementation (slice 2.5 added ~5 hours).
 
-If you're working with Claude Code and self-testing in parallel: realistic 2-3 calendar days.
+If you're working with Claude Code and self-testing in parallel: realistic 3-5 calendar days.
+
+**Six architectural principles bind every slice** (documented in detail in `02_service_contracts.md`):
+
+1. Bot NEVER auto-serves a question after answer (diagnostic exception)
+2. Old keyboards must be closed when new question served
+3. Active session state cleared on session boundary
+4. Webhook idempotency via tg_update_id
+5. UX never breaks on infrastructure failure (graceful fallbacks)
+6. Profile cache invalidation mandatory on writes
+
+When implementing any slice, verify the change preserves all six.
 
 ---
 
@@ -154,29 +168,91 @@ Replace random question selection with the existing v4 retrieval pipeline (pgvec
 
 ---
 
+## Slice 2.5: Architectural Retrofit
+
+### Goal
+
+Retrofit slice 2's verified base with seven fixes that emerged from architectural review. These should have been in slice 2 from the start, but emerged only after testing the base behavior. Fixing now is cheaper than fixing after slice 8.
+
+See `slice_2_5_retrofit.md` for the full Claude Code prompt and detailed manual test plan.
+
+### What's real (added on top of slice 2)
+
+- **Skip button:** New row 2 on question keyboards: `[Skip / I don't know]`. Inserts an attempt with `skipped=true`, shows explanation without "you picked X", advances to continuation buttons.
+- **Mid-question doubt detection:** When student types free text mid-question (with an open unanswered attempt), orchestrator routes to a hardcoded ack response with `[Back to the question]`, `[Skip this question]`, `[I have a different question]` buttons. Slice 2.5 uses hardcoded ack; slice 4's planner makes it LLM-driven.
+- **Close old keyboards on new question serve:** When VARC serves a new question, orchestrator removes the inline keyboard from the previous question via Telegram's `editMessageReplyMarkup`. Active session Redis state tracks `last_question_message_id` for this.
+- **`[Show my stats]` button:** New continuation row option. Tapping calls `profile_service.get_session_stats(student_id, session_id)` (orchestrator-composed response, no LLM). Shows attempted/correct/skipped/accuracy + subskill breakdown + duration.
+- **LLM API failure user-facing fallback:** When generation LLM fails (timeout, rate limit, etc.), retry once. If still failing, return canned "Hmm, having trouble thinking right now. Try again in a moment?" with `[Try again]` button.
+- **DB write failure handling:** Step 2 (user msg persist) and step 12 (assistant msg persist) wrapped in try/except with canned error before delivery. Step 13 (memory deltas) wrapped with log+continue (response already delivered).
+- **Webhook idempotency via `tg_update_id`:** Step 0 of `handle_message` checks if Telegram's update_id already exists in `v5.messages`. If yes, short-circuit (it's a Telegram retry). UNIQUE partial index on `messages.tg_update_id`.
+
+### What's stubbed (still)
+
+- Planner still hardcoded (slice 4)
+- Profile brief still hardcoded minimal (slice 5)
+- Episodic still empty (slice 7)
+- Session lifecycle still manual (slice 3)
+- Onboarding still skipped (slice 6)
+- Mentor still stub (slice 8)
+- Mid-question doubt response is hardcoded ack (slice 4 makes it LLM-driven)
+
+### Migrations
+
+- `011_add_skipped_to_attempts.sql`: ADD COLUMN skipped BOOLEAN DEFAULT FALSE
+- `012_add_tg_update_id_to_messages.sql`: ADD COLUMN tg_update_id BIGINT + UNIQUE partial index
+
+### Six architectural principles enshrined
+
+This slice is when the 6 principles become operational rules across services. See `docs/v5/02_service_contracts.md` for the full text.
+
+### Manual test
+
+See `slice_2_5_retrofit.md` for detailed test plan covering all 7 fixes.
+
+Summary:
+1. Tap [Skip / I don't know] on a fresh question. Verify skipped=true row, explanation without "you picked X", continuation buttons.
+2. Get a question, don't answer, type "what does X mean?" — verify mid-question doubt ack with 3 buttons. Tap [Back to the question]; verify re-render. Tap [Skip] from doubt buttons; verify skip flow.
+3. Get a question. Answer. Get next question. Scroll up to old question — verify A/B/C/D buttons gone (keyboard cleared).
+4. After 2-3 questions, tap [Show my stats] — verify stats response with continuation buttons.
+5. Break OPENROUTER_API_KEY. Send a message. Verify "Try again" fallback. Restore key, tap [Try again], verify original intent re-runs.
+6. Code review: try/except around user-msg-persist, assistant-msg-persist, memory-deltas.
+7. Curl the same Telegram update payload twice in quick succession; verify second is short-circuited (no duplicate user message in v5.messages).
+
+### Completion criteria
+
+- [ ] All 7 fixes implemented
+- [ ] All manual tests pass
+- [ ] Migrations 011 + 012 applied
+- [ ] Preflight 9/9 PASS
+- [ ] No regression in slice 1 or slice 2 manual tests
+- [ ] DECISIONS.md updated with the 6 architectural principles + slice 2.5 entries
+
+### Estimated time: 3-5 hours
+
+---
+
 ## Slice 3: Working Memory + Sessions
 
 ### Goal
 
-Make conversation feel continuous. Recent turns flow into the LLM context. Sessions auto-create, auto-track. Answers to questions get processed.
+Make conversation feel continuous. Recent turns flow into LLM context. Sessions auto-create on 30-min gap, auto-close on inactivity. Memory service is real (Postgres source of truth + Redis cache). Returning-after-break feature: bot offers to resume unfinished work.
 
-### What's real (added)
+### What's real (added on top of slice 2.5)
 
-- **Sessions table active:** Auto-create session on first message after >2 hour gap. Update `last_activity_at` on every turn. Update `message_count`, `question_count`, `correct_count`.
-- **Active session in Redis:** `state:tg:{tg_id}` populated and updated.
-- **Memory Service:** `get_active_session`, `set_active_session`, `update_active_session`, `clear_active_session`.
-- **Recent turns in agent prompt:** AgentContext includes last 10 turns. Agent system prompt includes them.
-- **VARC handles answers:** When user taps A/B/C/D, agent identifies it as `answer_to_question`, looks up correct answer, composes explanation, records attempt.
-- **Domain state:** active session tracks current question, questions_in_set, questions_answered.
+- **Sessions auto-management:** Session created on first message after 30-min gap. Updated on every turn (`last_activity_at`, `message_count`). Closed by `/admin/cleanup` cron after 30 min inactivity.
+- **Memory service real:** `append_turn` (Postgres source of truth + Redis LIST cache, 24h TTL, 50 items max). `get_recent_turns` (Redis-first with Postgres fallback, repopulates cache). `get_active_session`, `set_active_session`, `update_active_session`, `clear_active_session`.
+- **Session boundary state clearing (Principle 3, Bug 13):** When a new session starts, orchestrator DELs `state:tg:{tg_id}` BEFORE creating new state. domain_state from closed session never leaks.
+- **Returning-after-break feature (Bug 2):** New `memory_service.detect_session_resume_candidate(student_id)`. When a closed session has unanswered work and student returns within 14 days, VARC composes a resume prompt: "Welcome back. Last time we were on a {subskill} question — want to pick that up, or start fresh?" Buttons: `[Resume that question]` `[Start fresh]` `[Just chat first]`.
+- **VARC explanations LLM-generated:** Replaces slice 2's hardcoded explanation strings. MODEL_VARC_TUTOR (Haiku 4.5). System prompt includes Principle 1 enforcement ("never include a new question in your response").
+- **Cost/latency tracking:** New `v5.llm_calls` table logs every LLM call (service, model, tokens, cost, latency, success). Migration 013.
 
 ### What's stubbed (still)
 
-- Planner still hardcoded — but now hardcoded to:
-  - If text matches A/B/C/D pattern → action='answer_to_question'
-  - Otherwise → action='practice_request'
-- Profile brief still hardcoded minimal
-- Episodic still empty
-- Session-end cleanup not yet implemented (sessions stay open)
+- Planner still hardcoded with simple regex routing (slice 4)
+- Profile brief still hardcoded minimal (slice 5)
+- Episodic summaries still stubbed; cleanup just closes sessions, doesn't generate summaries (slice 7)
+- Mentor still stub (slice 8)
+- Onboarding still skipped (slice 6)
 
 ### Manual test
 
@@ -206,14 +282,19 @@ Make conversation feel continuous. Recent turns flow into the LLM context. Sessi
 
 ### Completion criteria
 
-- [ ] Sessions auto-create
+- [ ] Sessions auto-create on 30-min gap
 - [ ] Each turn updates session metadata
-- [ ] Answers processed correctly (correctness, attempt recorded)
-- [ ] Recent turns visible in context (LLM responses reference them)
+- [ ] Answers + skips processed correctly (preserved from slice 2.5)
+- [ ] Recent turns visible in context (LLM responses reference them naturally)
 - [ ] Active session persists across messages
-- [ ] domain_state in Redis has current question
+- [ ] domain_state in Redis has current question, last_question_message_id
+- [ ] **Session boundary clears Redis state (Bug 13):** old domain_state gone after new session starts
+- [ ] **Returning-after-break works (Bug 2):** unanswered question + 30+ min gap + new message → resume prompt with [Resume] [Start fresh] [Just chat]
+- [ ] **No regression:** all slice 2.5 fixes still work (skip, mid-question doubt, close keyboards, stats button, error fallback, idempotency)
+- [ ] LLM call costs logged in `v5.llm_calls`
+- [ ] /admin/cleanup cron runs, closes inactive sessions
 
-### Estimated time: 2-3 hours
+### Estimated time: 3-4 hours
 
 ---
 
@@ -221,12 +302,19 @@ Make conversation feel continuous. Recent turns flow into the LLM context. Sessi
 
 ### Goal
 
-Real intent-driven routing. The orchestrator's planner LLM call replaces hardcoded routing. Out-of-scope queries get soft-redirected.
+Real intent-driven routing. Single planner LLM call (Gemini Flash) replaces hardcoded routing. Out-of-scope queries soft-redirected. Critical: planner correctly distinguishes `small_talk` (no question served) from `practice_request` (question served) — Bug 15.
 
-### What's real (added)
+### What's real (added on top of slice 3)
 
-- **Planner LLM call:** Calls Gemini Flash with prompt + recent turns + active session + current message. Returns IntentClassification.
-- **Conditional context fetching:** Based on `context_needs` from planner, fetch only what's needed (still mostly stubs at this point — profile brief is hardcoded, episodic is empty).
+- **Planner LLM call:** `services/orchestrator/planner.py` with `classify(message, recent_turns, active_session_summary)` returning IntentClassification. MODEL_PLANNER (Gemini Flash by default). Cost: ~$0.0001-0.0003 per call. Latency: ~1.5s added.
+- **Robust JSON parsing with safe defaults:** On planner failure, default to `intent.action = "small_talk"` (NOT practice_request — safer). The bot will ask what student wants rather than auto-serving.
+- **Granular subskill enum (Bug 22):** Planner returns one of 12 specific subskills (`inference_basic`, `inference_advanced`, `main_idea_full_passage`, `specific_detail`, etc.). VARC falls back to `inference_basic` and logs misclassification if planner returns out-of-enum.
+- **Mixed-intent secondary signal (Bug 15):** Planner returns `intent.secondary_signal` for messages with both action and emotional undertone (e.g., "I'm stressed, give me an easy one" → action=practice_request, difficulty=easy, secondary_signal={type:"emotional_undertone", value:"mild_stress"}).
+- **Small_talk vs practice_request distinction (Bug 15):** Planner prompt explicitly distinguishes brief acknowledgments (small_talk) from forward-intent (practice_request). When in doubt: small_talk. Bot responds with warm ack + continuation buttons, no question.
+- **Conditional context fetching:** Orchestrator fetches profile/episodic/specific_messages per `context_needs` from planner.
+- **Out-of-scope guardrails:** Quant/LRDI/general off-topic → templated soft-redirect (no agent invocation, no LLM call). Buttons: `[VARC question]` `[Strategy chat]`.
+- **Intent-driven routing:** orchestrator routes to varc / mentor (stub) / out_of_scope handler based on intent.domain + action. Step 6.5 deterministic detection (slice 2.5) still runs first, overriding planner where appropriate (skip callbacks, continuation callbacks, mid-question doubts, answer regex).
+
 - **Guardrails:** When `intent.domain == 'out_of_scope'`, orchestrator handles directly with soft-redirect, no agent invocation.
 - **Response guidance:** Passed to agents in AgentContext. Agents are aware of `tone` and `should_acknowledge_feeling` (even if profile is still simple).
 
@@ -255,12 +343,17 @@ Real intent-driven routing. The orchestrator's planner LLM call replaces hardcod
 
 ### Completion criteria
 
-- [ ] Planner LLM call working (Gemini Flash)
+- [ ] Planner LLM call working (Gemini Flash via MODEL_PLANNER)
 - [ ] Intent classifications stored in messages.metadata
-- [ ] Out-of-scope queries get soft-redirect
+- [ ] **Small_talk vs practice_request correctly distinguished (Bug 15):** "thanks" / "ok" / "got it" → small_talk + continuation buttons (NO new question); "another" / "next" → practice_request + new question
+- [ ] **Mixed-intent secondary signal works (Bug 15):** "I'm stressed, give me an easy one" → action=practice_request, secondary_signal captured, VARC tone adjusted
+- [ ] **Granular subskill from planner (Bug 22):** "main idea question" → planner returns `main_idea_full_passage` exactly
+- [ ] Out-of-scope queries get soft-redirect with `[VARC question]` `[Strategy chat]` buttons
 - [ ] Mentor stub invoked for `domain=mentor`
 - [ ] Out-of-scope queries don't invoke agents (cost savings)
 - [ ] Response guidance passes through to agents
+- [ ] **No regression:** all slice 1-3 + 2.5 behavior preserved
+- [ ] Default to `small_talk` on planner failure (NOT practice_request) — verify by temporarily breaking planner key
 
 ### Estimated time: 3-4 hours
 
@@ -270,15 +363,18 @@ Real intent-driven routing. The orchestrator's planner LLM call replaces hardcod
 
 ### Goal
 
-Replace hardcoded profile brief with real profile data. Responses become personalized.
+Replace hardcoded profile brief with real profile data. Responses become personalized. Default difficulty derived from profile (Bug 23). Empty-state fallbacks for new students (Bug 25).
 
-### What's real (added)
+### What's real (added on top of slice 4)
 
-- **Profile Service: `get_tutor_brief`** — full implementation. Pulls from student_profile, student_skill_profile, student_notes, recent episodic summaries (still empty for now). Template-assembled string.
-- **Profile Service: `get_minimal_brief`** — full implementation.
-- **Profile Service: `get_active_notes`** — SQL query with confidence × recency scoring.
-- **Profile brief cache:** Redis cache for tutor brief, 30-min TTL.
-- **Manual seed notes for testing:** Insert ~5 fake notes for yourself manually to test injection.
+- **Profile Service `get_tutor_brief`** — full implementation. Pulls from `v5.student_profile`, `v5.student_skill_profile`, `v5.student_notes`, recent episodic summaries (still empty until slice 7). Template-assembled string. NO LLM call.
+- **Empty-state fallbacks (Bug 25):** Students with <5 questions practiced get coherent friendly text, not "N/A" placeholders. Students with no recent sessions get "first time back since onboarding {N} days ago" or similar. Never empty sections.
+- **`get_minimal_brief`** — short version (~50-100 tokens) for low-context queries.
+- **`get_default_difficulty(student_id)` (Bug 23):** Derives from preparation_stage. `just_starting`→easy, `mid_prep`→medium, `final_3_months`→medium, `revision`→hard. Used by VARC when planner doesn't supply difficulty (replaces slice 4's "fall back to medium" heuristic with profile-aware derivation).
+- **`get_active_notes(student_id, filter)`:** SQL with `confidence × exp(-Δt / 30 days)` scoring (30-day half-life), top 20 ordered by score.
+- **Profile brief Redis cache:** `profile:brief:{student_id}` with 30-min TTL. Read in `get_tutor_brief`. Invalidated (DEL) on any write to student_notes/student_profile/student_skill_profile (Principle 6 — Bug 14 hardening).
+- **Skill signals computed from `v5.student_question_attempts`:** top/bottom subskill (with min 5 attempts), recent accuracy, trap counts. Cached briefly in Redis (1-hour TTL).
+- **`/admin/notes/add` endpoint:** For manual note testing before slice 7 builds auto-extraction.
 
 ### What's stubbed (still)
 
@@ -324,10 +420,13 @@ WHERE student_id = 'your-uuid';
 ### Completion criteria
 
 - [ ] Tutor brief assembled from real data
-- [ ] Notes show up in responses meaningfully
-- [ ] Profile brief cache working (faster on cache hit)
-- [ ] Minimal vs full brief used appropriately based on planner
-- [ ] Performance stats from student_skill_profile included
+- [ ] Notes show up in responses meaningfully (LLM weaves them naturally)
+- [ ] **Profile brief cache invalidation works (Principle 6, Bug 14):** every write to student_notes/student_profile DELs the cache; verify GET returns null after write
+- [ ] **Empty-state fallbacks work (Bug 25):** fresh student with 0 attempts gets coherent text, not "N/A"
+- [ ] **Default difficulty derives from preparation_stage (Bug 23):** verify by setting preparation_stage manually and observing VARC's question difficulty
+- [ ] Minimal vs full brief used appropriately based on planner's context_needs
+- [ ] Performance stats from `v5.student_question_attempts` included
+- [ ] **No regression:** all slice 1-4 + 2.5 behavior preserved
 - [ ] Total response time still < 5 seconds (cache helps)
 
 ### Estimated time: 2-3 hours
@@ -338,16 +437,20 @@ WHERE student_id = 'your-uuid';
 
 ### Goal
 
-New users go through full onboarding: profile fields + diagnostic test + mentor synthesis.
+New users go through full onboarding: profile fields + optional 5-question diagnostic test + mentor synthesis. Includes pause option (Bug 6) and post-onboarding session boundary (Bug 24).
 
-### What's real (added)
+### What's real (added on top of slice 5)
 
-- **Orchestrator: `handle_onboarding_step`** — full FSM implementation.
-- **Inline keyboards** for each step (not just A/B/C/D).
-- **VARC: `serve_diagnostic_question`** — selects question based on q_index (1=easy inference, 2=easy main_idea, 3=medium inference, 4=medium specific_detail, 5=hard inference).
-- **VARC: `handle_diagnostic_answer`** — brief explanation + advance.
-- **Mentor: `synthesize_diagnostic`** — full implementation. LLM call (Sonnet) for the welcome.
-- **Mentor: `handle_skip_diagnostic`** — for users who skip the test.
+- **Orchestrator `handle_onboarding_step`:** Full FSM implementation. States: `not_started` → `awaiting_name` → `awaiting_target_year` → `awaiting_experience_level` → `awaiting_preparation_stage` → `awaiting_hours_per_day` → `awaiting_target_colleges_optional` → `awaiting_why_cat_optional` → `diagnostic_offered` → `diagnostic_active` → `mentor_synthesis` → `completed`.
+- **Inline keyboards** for each onboarding step (no LLM calls during data collection).
+- **Onboarding pause option (Bug 6):** Every state (except `diagnostic_active`) includes `[Do this later]` button. On tap: set `onboarding_paused_at = now`, send "Sure, take your time. Just send a message when you're ready." Resume from same state on next message.
+- **VARC `serve_diagnostic_question(student_id, q_index)`:** Q1 easy inference_basic, Q2 easy main_idea_full_passage, Q3 medium inference_basic, Q4 medium specific_detail, Q5 hard inference_basic. Specific picks, NOT 6-tier ladder.
+- **VARC diagnostic mode (auto-continue exception to Principle 1):** During Q1-Q4, after answer/skip, scoring + brief explanation + AUTO-SERVE next diagnostic question. NO continuation buttons during diagnostic. Q5: scoring + transition message + trigger mentor_synthesis. Skip button still works during diagnostic.
+- **Mentor `synthesize_diagnostic`:** Sonnet 4.5. Inputs: profile + 5 diagnostic attempts. Output: warm 3-4 paragraph synthesis ending with deterministic 4-button continuation row: `[Practice my weakest]` `[Explore my strongest]` `[Ask DHRI a question]` `[Just chat first]`.
+- **Mentor `handle_skip_diagnostic`:** For students who skip diagnostic. Shorter synthesis. Buttons: `[Start with easy inference]` `[Pick my own focus]` `[Just chat]`.
+- **Post-onboarding session boundary (Bug 24):** When mentor synthesis completes, the onboarding session is closed (`ended_at = now`, `end_reason = 'onboarding_complete'`). DEL `state:tg:{tg_id}` (Principle 3). Next message starts a fresh session, normal practice flow. Diagnostic attempts (`is_diagnostic = true`) DO count toward stats but are flagged for analytics.
+- **Migration 014_onboarding_columns.sql:** Adds `onboarding_paused_at`, `diagnostic_question_count` to `v5.student_profile` (if not already present from slice 1).
+
 
 ### What's stubbed (still)
 
@@ -400,10 +503,14 @@ New users go through full onboarding: profile fields + diagnostic test + mentor 
 
 - [ ] FSM advances through all states
 - [ ] Each FSM transition saves data correctly
-- [ ] Diagnostic test serves 5 specific questions
+- [ ] Diagnostic test serves 5 specific questions in correct order (Q1 easy inference → Q5 hard inference)
 - [ ] Mentor synthesis uses Sonnet, references test results
 - [ ] Skip path works (mentor synthesis without test data)
-- [ ] After onboarding, normal flow works
+- [ ] **Onboarding pause works (Bug 6):** [Do this later] sets onboarding_paused_at, resumes from same step on next message
+- [ ] **Post-onboarding session boundary (Bug 24):** onboarding session closed after synthesis; new session for next message
+- [ ] **Existing students unaffected:** any students predating slice 6 have onboarding_complete=true (set via migration)
+- [ ] **No regression:** all slice 1-5 + 2.5 behavior preserved
+- [ ] After onboarding, normal flow works (continuation buttons after answers, etc.)
 
 ### Estimated time: 3-4 hours
 
@@ -413,56 +520,45 @@ New users go through full onboarding: profile fields + diagnostic test + mentor 
 
 ### Goal
 
-When sessions end, generate episodic summaries and extract profile notes. Profile grows organically.
+When sessions end, generate episodic summaries and extract profile notes via single combined LLM call (cost optimization). Profile grows organically. Returning-after-break (slice 3) now has rich summaries to draw from.
 
-### What's real (added)
+### What's real (added on top of slice 6)
 
-- **Memory Service: `process_session_end`** — full pipeline. Combined LLM call for summary + extraction.
-- **Memory Service: `cleanup_inactive_sessions`** — cron job, runs every 10 min.
-- **Profile Service: extraction integration** — adds notes returned from extraction LLM call.
-- **Profile Service: conflict resolution** — basic rules (latest wins for life_event, sensitivity flag handling).
-- **Episodic summaries used:** Now that they exist, planner can request them, profile brief can include "recent activity" section.
+- **Memory Service `process_session_end(session_id)`:** Full pipeline. Single LLM call (MODEL_EXTRACTOR = Gemini Flash) returns JSON with: summary, topics, notes_to_add (with category, content, confidence, expires_after_days), skill_signals.
+- **Memory Service `cleanup_inactive_sessions`:** Cron, runs every 10 min. Closes sessions inactive > 30 min, triggers process_session_end for each.
+- **Profile Service extraction integration:** Adds notes from extraction LLM via `add_note` (which DELs cache per Principle 6). Reinforces matches against existing notes (substring overlap > 50%) instead of duplicating.
+- **Profile Service conflict resolution:** Basic rules — latest wins for category=context with expires_after_days; never override category=goal without explicit student statement.
+- **Episodic summaries used:** Planner can request them via `context_needs.episodic.needed`. Profile brief includes "recent activity" section drawing from latest summary.
+- **Note expiration:** category=context defaults to 14-day expiration. category=anxiety_pattern/skill_gap/goal: no expiration.
 
 ### What's stubbed (still)
 
 - Mentor reactive mode: slice 8
-- Mentor observer mode: slice 8
+- Mentor observer mode: slice 8 (raw signal source for slice 7's extractor)
 
 ### Manual test
 
-1. Have an active session (do 4-5 questions, with 1-2 wrong on inference)
-2. Don't send messages for 45+ minutes
-3. Wait or manually trigger cleanup: `curl -X POST -H "X-Admin-Secret: ..." https://your-railway-url/admin/cleanup-sessions`
-4. Expected: cron processes the session
-5. Check Postgres:
-   ```sql
-   SELECT * FROM sessions WHERE student_id = 'your-uuid' ORDER BY ended_at DESC LIMIT 1;
-   -- ended_at is set, end_reason='inactivity_timeout'
-   
-   SELECT * FROM episodic_summaries WHERE student_id = 'your-uuid' ORDER BY created_at DESC LIMIT 1;
-   -- 1 row, with summary_text, themes, key_moments, performance_data
-   
-   SELECT * FROM student_notes WHERE student_id = 'your-uuid' ORDER BY created_at DESC LIMIT 5;
-   -- 1-3 new notes from this session
-   ```
-6. Send a new message (starts new session)
-7. Expected: Bot's response includes reference to "yesterday" or "last session" if profile loaded
-8. Check planner output:
-   ```sql
-   SELECT metadata->'intent_classification'->>'context_needs' FROM messages 
-   WHERE role='user' AND created_at > now() - interval '5 min';
-   -- May show episodic.needed=true
-   ```
+1. Have an active session, do 4-5 questions (mix correct/wrong/skip).
+2. Manually trigger cleanup or wait > 30 min.
+3. Verify session closed in DB: `SELECT ended_at, end_reason FROM v5.sessions WHERE student_id = 'your-uuid' ORDER BY ended_at DESC LIMIT 1;`
+4. Verify episodic summary: `SELECT * FROM v5.episodic_summaries WHERE student_id = 'your-uuid' ORDER BY created_at DESC LIMIT 1;` — 1 row with sensible summary, topics, key_moments, performance_data.
+5. Verify notes: `SELECT * FROM v5.student_notes WHERE student_id = 'your-uuid' ORDER BY created_at DESC LIMIT 5;` — 1-3 new notes with reasonable categories.
+6. Verify cache invalidation: `GET profile:brief:{student_id}` in Redis returns nil after extraction.
+7. Send a new message (starts new session). Verify response references "last session" naturally.
+8. Run a second similar session covering same ground. Verify duplicate notes are reinforced (last_reinforced updated, confidence bumped) NOT duplicated.
+9. Verify v5.llm_calls has the extraction call (~$0.005).
 
 ### Completion criteria
 
 - [ ] Inactive sessions auto-close
-- [ ] Episodic summaries generated correctly
+- [ ] Episodic summaries generated correctly with sensible content
 - [ ] Profile notes extracted from sessions
-- [ ] Existing notes get reinforced when relevant
-- [ ] New notes don't duplicate existing ones
+- [ ] **Profile brief cache invalidated on extraction (Principle 6, Bug 14):** every add_note DELs cache
+- [ ] Existing notes get reinforced when relevant (not duplicated)
 - [ ] Sensitive notes flagged appropriately
-- [ ] LLM call cost ~$0.005 per session
+- [ ] LLM call cost ~$0.005 per session (Gemini Flash, single combined call)
+- [ ] Returning-after-break logic (slice 3) works with new episodic data
+- [ ] **No regression:** all slice 1-6 + 2.5 behavior preserved
 
 ### Estimated time: 3-4 hours
 
@@ -472,59 +568,120 @@ When sessions end, generate episodic summaries and extract profile notes. Profil
 
 ### Goal
 
-Mentor agent fully functional. Strategic queries get real responses. Observer detects patterns inline.
+Mentor agent fully functional. Strategic queries get real responses. Observer detects patterns inline. Real-time pattern signal flows into AgentContext (Bug 4). The 3 priority "wow moments" verified end-to-end.
 
-### What's real (added)
+### What's real (added on top of slice 7)
 
-- **Mentor Agent: `handle`** — full implementation. Single LLM call (Sonnet for nuanced) using full profile + episodic context. Handles:
+
+- **Mentor Agent `handle(context)`:** Full implementation. Single LLM call (Sonnet 4.5 = MODEL_MENTOR) using full profile + episodic + notes context. Handles:
   - `action=review_progress` ("how am I doing?")
   - `action=vent` (emotional support)
   - `action=meta` (questions about dhri itself)
   - `action=casual` (warm acknowledgments)
-- **Mentor Agent: `inline_observe`** — runs after every successful turn (async). Processes observer events. Detects:
-  - Consecutive wrongs (3+) → emotional_signal note
+- **Contextual continuation buttons (deterministic, in orchestrator):** After mentor returns, orchestrator picks one of 4 button-set patterns based on intent.action + emotional_tone:
+  - Anxiety/frustration: `[Try one easy one]` `[Different subskill]` `[Talk it out more]` `[Take a break]`
+  - Strategy/review_progress: `[Practice my weak areas]` `[Show my stats]` `[Ask another question]` `[I'm done]`
+  - Motivation/casual: `[One easy win]` `[Just chat]` `[Show my stats]` `[I'm done]`
+  - Meta queries: `[OK, let's practice]` `[Different subskill]` `[Ask another meta question]` `[I'm done]`
+- **System prompt rule for Mentor LLM:** "End with a brief 'what's next' question. Do NOT include a question with passage and A/B/C/D options. The button options are added by the system."
+- **Mentor `inline_observe(student_id, session_id, intent, agent_response, recent_turns)`:** Runs async via `asyncio.create_task` after response sent. Gemini Flash scans recent turns for patterns. Returns 0-3 lightweight events to insert into `v5.observer_events`:
+  - Consecutive wrongs (3+) → `pattern_name='consistent_struggle'`
   - Same trap multiple times → reinforce pattern note
-  - Metacognitive questions → high-value note
-  - Long pauses → emotional_signal possible
-  - Self-corrections → growth note
-- **Async post-processing:** Orchestrator triggers `mentor.inline_observe` via async task after sending response.
+  - Metacognitive questions → `pattern_name='breakthrough'`
+  - Self-corrections → growth signal
+  - Frustrated language → `pattern_name='frustration'`
+- **Real-time pattern signal in AgentContext (Bug 4):** Before agent invocation, orchestrator queries `v5.observer_events` for high-confidence patterns within current session. Sets `context.realtime_pattern` if relevant. VARC's LLM system prompt includes this signal: "Note: this is the {N}th time the student has hit this trap in recent sessions. Reference this pattern explicitly in your explanation." This makes wow-moment-1 work within a session, not just across sessions.
+- **Slice 7's extractor (already built) consumes observer_events:** Events with confidence > 0.7 are considered note candidates by the extractor.
 
 ### What's stubbed (still)
 
-- Initiator mode (proactive messages): deferred to v2
-- Scheduler service: deferred to v2
+- Initiator mode (proactive messages): deferred to v1.5
+- Scheduler service: deferred to v1.5
+- Cross-session goal tracking: deferred to v1.5
 
 ### Manual test
 
-1. Send "how am I doing in VARC?"
-2. Expected: Mentor responds with specific data (accuracy, weakest area, pattern, recent progress) — not generic
-3. Send "I'm so frustrated, I keep messing up inference"
-4. Expected: Mentor responds with empathy + specific reference to your inference pattern + suggestion
-5. Get 3 wrong answers in a row on practice
-6. Check observer events:
-   ```sql
-   SELECT * FROM observer_events WHERE event_type IN ('wrong_answer', 'consecutive_wrong')
-   ORDER BY created_at DESC LIMIT 5;
-   -- Should see consecutive_wrong event after 3rd wrong
-   ```
-7. Check student_notes for new emotional/pattern notes:
-   ```sql
-   SELECT * FROM student_notes WHERE student_id = 'your-uuid' AND created_at > now() - interval '10 min';
-   -- May have new note about frustration or trap pattern
-   ```
-8. Send "what is dhri?"
-9. Expected: Mentor handles meta question, explains itself
+**Reactive mentor:**
+1. Send "I'm feeling really demotivated, my accuracy isn't improving" → Mentor responds (not VARC); response references specific past struggles if notes exist; ends with anxiety-set continuation buttons.
+2. Send "I have 3 months left, what should I focus on?" → Mentor responds with strategic advice grounded in profile + notes; ends with strategy-set continuation buttons.
+3. Send "what is dhri?" → Mentor handles meta question with meta-set continuation buttons.
+
+**Observer mode:**
+4. Get 3 inference questions wrong with same trap → check `v5.observer_events`: expect rows with pattern_name='consistent_struggle' and confidence > 0.7.
+5. Send "ugh, this is frustrating" after wrong answer → expect pattern_name='frustration' event.
+6. Verify response shown to user is unaffected by observer events (response delivered before observer runs).
+
+**Real-time signal (Bug 4):**
+7. Within a single session: get a question wrong via out_of_scope trap. Then get another wrong via same trap. Verify VARC's explanation explicitly references the trap pattern (not generic). Check `messages.metadata.context_loaded.realtime_pattern` is populated.
+
+**Wow moment 1 (cross-session pattern recall):**
+8. Have a session with 2-3 wrong answers via out_of_scope trap. Trigger cleanup. Start new session. Get an inference question wrong via out_of_scope. Verify VARC's explanation references the past pattern explicitly ("this is the kind of thing we've talked about — last time you hit out_of_scope on inference too...").
+
+**Wow moment 2 (returning-after-break):**
+9. Have a session, leave a question unanswered, wait 30+ min (or trigger cleanup). Send "hi". Verify resume prompt with specific reference to the unanswered question. Tap [Resume] → verify question re-served.
+
+**Wow moment 3 (topic switch):**
+10. Mid-VARC session (just got a question), abruptly type "actually how do I manage my time better?" → Verify Mentor takes over (planner classifies as mentor + review_progress); response acknowledges the switch ("happy to come back to that question anytime"); ends with strategy-set buttons.
 
 ### Completion criteria
 
-- [ ] Mentor handles strategic queries with real data
-- [ ] Mentor handles emotional venting with specificity
+- [ ] Mentor handles strategic queries with real data (notes + episodic + profile referenced)
+- [ ] Mentor handles emotional venting with specificity (references past patterns)
+- [ ] **Continuation buttons after every Mentor response (Principle 1):** different button sets for anxiety vs strategy vs motivation vs meta
 - [ ] Inline observer processes events without blocking response
 - [ ] Pattern detection triggers note creation/reinforcement
-- [ ] Mentor uses appropriate model (Sonnet for nuance)
+- [ ] **Real-time pattern signal flows into AgentContext (Bug 4):** within-session pattern detection works
+- [ ] **Wow moment 1 verified:** wrong answer references past mistake (cross-session)
+- [ ] **Wow moment 2 verified:** returning-after-break, bot remembers
+- [ ] **Wow moment 3 verified:** topic switches handled smoothly
+- [ ] Mentor uses MODEL_MENTOR (Sonnet 4.5)
 - [ ] Async post-processing doesn't add user-visible latency
+- [ ] **No regression:** all slice 1-7 + 2.5 behavior preserved
 
-### Estimated time: 2-3 hours
+### Estimated time: 3-4 hours
+
+---
+
+## After All Slices: Quality Pass (1 day)
+
+Once slice 8 is verified, before shipping to first 5-10 users, do a focused quality pass:
+
+### Day 1: Self-use as a real student
+
+Use dhri yourself for 2-3 hours of actual VARC prep. Don't test individual features — use it AS the student. Note every place that feels:
+- Slow (>5s response)
+- Confusing (had to re-read or scroll up)
+- Robotic (response felt templated, not warm)
+- Broken (didn't do what you expected)
+- Missing (wanted a button/option that wasn't there)
+
+Most issues will be prompt-engineering tweaks, not architectural. Iterate the system prompts in:
+- `services/varc/prompts.py` — explanation tone, length, warmth
+- `services/mentor/prompts.py` — empathy, specificity, transitions
+- `services/orchestrator/planner.py` — small_talk vs practice_request edge cases
+
+### Day 2: Friend test (optional)
+
+If you have a friend prepping for CAT, give them access for an hour. Watch (with permission) what they do. Their first 10 minutes will reveal more than your own testing — they'll do things you didn't predict.
+
+### Quality bar before shipping:
+
+- [ ] You'd send dhri's link to a friend without caveats
+- [ ] Average response feels like a tutor, not a chatbot
+- [ ] No more than 1 in 20 responses feels robotic or off
+- [ ] No crashes or stuck states observed in 2+ hours of personal use
+- [ ] Cost per active student per day < ₹15 (~$0.18)
+
+If quality bar isn't hit: more prompt iteration. If structural issues remain: don't ship; address first.
+
+### Shipping protocol:
+
+1. Tag git: `git tag v1.0 && git push --tags`
+2. Final preflight: 9/9 PASS on production
+3. Post to your network: 5-10 close friends/colleagues prepping for CAT
+4. Watch logs (Sentry, v5.llm_calls cost rollup) for first 48 hours
+5. Daily check-in: read 5-10 conversations end-to-end, note recurring issues
+6. Iterate prompts daily for first week; bigger structural changes go on a backlog
 
 ---
 

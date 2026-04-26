@@ -109,6 +109,16 @@ async def clear_state(tg_id: int) -> None:
     await redis.delete(_state_key(tg_id))
 
 
+async def update_state(tg_id: int, ttl: int = STATE_TTL, **patch: Any) -> dict:
+    """Read-modify-write of `state:tg:{tg_id}`. Used by the v5 bus to track
+    last_question_message_id / last_question_attempt_id without clobbering
+    other fields written by the orchestrator."""
+    state = await get_state(tg_id) or {}
+    state.update(patch)
+    await set_state(tg_id, state, ttl)
+    return state
+
+
 # ─── LOCKS ──────────────────────────────────────────────────────────────────
 
 async def acquire_lock(key: str, ttl: int) -> bool:
