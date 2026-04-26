@@ -1,10 +1,22 @@
 # Data Model — DHRI v5
 
+## ⚠️ Schema source-of-truth notice
+
+**This document is the source of truth for v5 schema. Every CREATE TABLE migration must match the column list documented here EXACTLY. Every ALTER TABLE migration referenced in the slice roadmap must match the columns specified there.**
+
+**When a slice adds a new table:** the migration's CREATE TABLE statement includes ALL columns documented for that table here, even if some columns aren't used by the current slice. This prevents schema drift.
+
+**When this document changes:** also update `scripts/check_schema_drift.py`'s EXPECTED dict and any affected slice's roadmap migrations subsection.
+
+**Schema drift is checked by:** `python -m scripts.check_schema_drift`. Run before starting any slice and after applying any migration. Exit code 0 = clean; 1 = drift exists.
+
+---
+
 ## Overview
 
 dhri v5 is structured around four storage layers, each with a distinct purpose:
 
-1. **Postgres (durable):** identity, conversation history, profile, episodic summaries, content
+1. **Postgres (durable):** identity, conversation history, profile, episodic summaries, content, LLM call observability
 2. **Redis (ephemeral):** active session state, working memory cache, locks, counters
 3. **pgvector (Postgres extension):** embedding-based retrieval for questions and (eventually) messages
 4. **Existing v4 tables (kept):** questions, passages, attempts, subskills, traps — domain content
@@ -12,6 +24,8 @@ dhri v5 is structured around four storage layers, each with a distinct purpose:
 **Postgres schema separation:** All v5 tables live in a dedicated `v5` Postgres schema. v4 tables continue to live in `public`. v5 services qualify all table names (`v5.students`, `v5.messages`, etc.). This keeps v5 truly append-only and lets v4 stay 100% functional during the v5 build, supporting the strangler-fig migration discipline. Schema names are omitted in this document for clarity but should be applied in actual SQL (`v5.students`, `public.questions`, etc.).
 
 The fundamental principle: **Postgres is the source of truth. Redis is a performance cache.** If Redis goes down or evicts keys, the system rehydrates from Postgres. No data loss.
+
+This is enforced architecturally: any code path that closes a Postgres session MUST also clear the corresponding Redis state (`state:tg:{tg_id}`). This invariant is the structural fix for Bug 13 (Principle 3 violations). See `02_service_contracts.md` Architectural Principles section for the full rule.
 
 This document covers all data shapes. Relationships, examples, lifecycles. Read this before reading service contracts — it's the foundation.
 
@@ -400,14 +414,18 @@ created_at            TIMESTAMP DEFAULT now()
 - `(ended_at, last_activity_at)` partial where ended_at IS NULL (for inactivity cleanup)
 
 **Lifecycle:**
-- Created when first message arrives after a 2-hour gap (or first ever message)
-- Updated on every turn (last_activity_at, message_count)
+- Created when first message arrives after a **30-minute gap** (or first ever message). 30-min threshold chosen empirically for CAT prep behavior — see DECISIONS.md "Slice 3 verified: 30-minute session boundary".
+- Updated on every turn: single UPDATE that bumps both `last_activity_at = now()` and `message_count = message_count + 1`. The two MUST move together — drift between them would indicate a bug.
 - Updated when question answered (question_count, correct_count)
-- Closed when:
-  - Inactivity > 45 minutes (cron-driven)
+- Closed by either:
+  - `cleanup_inactive_sessions` cron (Postgres `last_activity_at < now() - interval '30 minutes'`)
   - Explicit end intent ("I'm done for today")
-  - Session switch (mentor → varc → mentor counts as same session if quick; full switch creates new session)
+  - Session switch (mentor → varc → mentor counts as same session if quick; full switch creates new session) — slice 4+
   - Error during processing
+
+**`message_count` semantic:** counts ORCHESTRATOR TURNS, not individual messages. One turn = one user message + one assistant response = `+1`. If we later want a user-only count, that's a different column. (See DECISIONS.md "Slice 3 verification: message_count + Redis cleanup fixes".)
+
+**Critical invariant — Redis cleanup on close:** Every code path that closes a Postgres session MUST also clear the corresponding Redis state (`state:tg:{tg_id}`). This includes `cleanup_inactive_sessions`, explicit_end handlers, and any future session-close path. Failure to clear Redis leaves stale state that resolve_session has to detect on the next message — extra latency and a subtle Bug 13 surface. The invariant lives in code: `close_session` and its callers ALL DEL Redis state. (See Architectural Principles in `02_service_contracts.md`.)
 
 **Written by:** orchestrator (create, update), session cleanup cron (close on inactivity)
 **Read by:** orchestrator (loading active session), memory service (closing session, generating summary), profile service (extraction context)
@@ -668,6 +686,70 @@ Not used in v1. Defined for v2 proactive messaging.
 
 ---
 
+### `llm_calls`
+
+Observability table for every LLM call made by any v5 service. Introduced in slice 3.
+
+```
+llm_calls
+─────────
+id                   UUID PRIMARY KEY DEFAULT gen_random_uuid()
+student_id           UUID             (FK to students; nullable for system-level calls)
+session_id           UUID             (FK to sessions; nullable when call happens outside a session)
+message_id           UUID             (FK to messages; nullable; the assistant message this call produced, if any)
+service              VARCHAR(30) NOT NULL  ('orchestrator' | 'varc' | 'mentor' | 'memory')
+model                VARCHAR(60) NOT NULL  (e.g., 'anthropic/claude-haiku-4-5', 'anthropic/claude-sonnet-4-5')
+purpose              VARCHAR(40) NOT NULL  (call-site label; see enum below)
+input_tokens         INTEGER          (nullable; populated when OpenRouter response includes usage data)
+output_tokens        INTEGER          (nullable; same)
+cost_usd             DOUBLE PRECISION (nullable; computed from token counts × model pricing)
+latency_ms           INTEGER          (nullable; wall-clock time of the call)
+success              BOOLEAN NOT NULL DEFAULT true
+error_message        TEXT             (nullable; populated on failure)
+created_at           TIMESTAMP DEFAULT now()
+```
+
+**`purpose` enum** (extend as new call sites land):
+- `intent_classification` — planner LLM call (slice 4+)
+- `answer_explanation` — VARC answer scoring + explanation (slice 3+)
+- `skip_explanation` — VARC explanation after student skipped (slice 3+)
+- `concept_explanation` — VARC teaching response (slice 4+)
+- `resume_prompt` — VARC welcome-back when returning after break (slice 3+)
+- `mentor_strategic_response` — Mentor reactive response (slice 8+)
+- `mentor_diagnostic_synthesis` — Mentor onboarding synthesis (slice 6+)
+- `mentor_inline_observe` — Mentor observer mode (slice 8+)
+- `session_end_extraction` — Memory service's session-end summary + notes extraction (slice 7+)
+
+**Indexes:**
+- `(student_id, created_at DESC)` (primary access for per-user analytics)
+- `(service, model)` (for cost rollups by service/model)
+- partial index `WHERE success = false` (fast lookup of failed calls)
+
+**Lifecycle:**
+- Inserted by `shared/observability/llm_log.py:record_llm_call` after every LLM call (success OR failure)
+- Best-effort insertion: if Postgres write fails, the user-facing response is NOT impacted. The call is logged to stdout instead, and the metric is lost. (Per Principle 5.)
+- Never updated. Never deleted. Pure append-only.
+
+**Written by:** every service that makes LLM calls (orchestrator, VARC, mentor, memory). Always via `record_llm_call`, never via direct INSERT.
+**Read by:** cost-monitoring dashboards, eval pipeline, manual analytics queries.
+
+**Cost example:**
+```sql
+-- Daily cost by service
+SELECT 
+  service, 
+  count(*) AS calls,
+  round(sum(cost_usd)::numeric, 4) AS total_cost_usd,
+  round(avg(latency_ms)) AS avg_latency_ms
+FROM v5.llm_calls
+WHERE created_at > now() - interval '1 day'
+  AND success = true
+GROUP BY service
+ORDER BY total_cost_usd DESC;
+```
+
+---
+
 ## Existing v4 Tables (Kept, Some Modifications)
 
 ### `tg_users` — DEPRECATED in v5
@@ -711,6 +793,24 @@ total_questions       INTEGER
 total_correct         INTEGER
 last_updated          TIMESTAMP
 ```
+
+---
+
+## Content Rendering and Parse Mode
+
+All assistant messages delivered to Telegram use **HTML parse mode** (`parse_mode=HTML`). Implementation lives in `services/message_bus/main.py:_safe_edit_text` and `_safe_send_text`.
+
+**Why HTML over Markdown:** Subskill names (e.g., `inference_basic`, `main_idea_full_passage`) contain underscores. Telegram's legacy Markdown parser interprets unmatched `_` as the start of an italic marker and rejects the entire message. HTML parse mode only requires escaping `<`, `>`, `&` — none of which appear in normal English text or subskill names. Far more permissive for the kind of content the bot generates. (See DECISIONS.md "Markdown rendering: switch from Markdown to HTML parse mode" for rationale.)
+
+**Two content sources, two handling rules:**
+
+1. **Orchestrator-composed templates** (stats, error fallback, soft-redirect, mid-question doubt ack, session resume prompt, continuation acknowledgments): may contain HTML tags `<b>`, `<i>`, `<u>`, `<s>`, `<a href>`, `<code>`, `<pre>` — these are the tags Telegram's HTML parser supports. NOT escaped before delivery. Templates are author-controlled; tags are intentional.
+
+2. **LLM-generated content** (VARC explanations, Mentor responses, resume prompt body): HTML escape pass via `html.escape()` before delivery. The LLM's system prompt explicitly instructs it to output plain text — no markdown, no HTML — so escaping only handles edge cases where the LLM disobeys.
+
+**Bus-side fallback:** `_safe_edit_text` and `_safe_send_text` retry without `parse_mode` if Telegram returns a parse error (BadRequest with "can't parse entities"). This ensures every message delivers, even if escape passes miss something.
+
+**Templates that contain HTML tags should be marked in code** with a clear convention (e.g., `_html_template = ...`) so future maintainers don't confuse them with plain-text content that would need escaping.
 
 ---
 

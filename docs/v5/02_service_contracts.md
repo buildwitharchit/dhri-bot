@@ -57,11 +57,23 @@ Telegram inline keyboards persist forever in chat history. If the student scroll
 
 ### Principle 3: Active session state is per-session and cleared on session boundary
 
-When a new session starts (after 30+ minute gap, explicit end, or session switch), the orchestrator MUST delete the active session Redis key (`state:tg:{tg_id}`) before recreating it for the new session. This prevents `domain_state` from the closed session leaking into the new session.
+When a session ends (after 30+ minute inactivity gap, explicit end, session switch, or any other reason), the active session Redis key (`state:tg:{tg_id}`) MUST be cleared. This prevents `domain_state` from a closed session leaking into the next session.
+
+**The structural invariant (added during slice 3 verification, Bug 13 enforcement):**
+
+> **Any code path that closes a Postgres session MUST also clear the corresponding Redis state for that student's tg_id, in the same operation.**
+
+This means:
+- `cleanup_inactive_sessions` (cron) — closes sessions in Postgres AND DELs `state:tg:{tg_id}` for each. Per-session, not mass-delete.
+- `close_session(session_id, end_reason)` (memory service) — same; called by cleanup, by explicit_end handlers, by error paths.
+- Future session-close paths (slice 4's session_switch on topic change, slice 6's onboarding-complete close, etc.) — same rule applies.
+
+**Defense in depth:** Even with the cleanup-side invariant above, `resolve_session` (memory service) defensively verifies the session pointed to by Redis is still active in Postgres at the start of every turn. If `ended_at IS NOT NULL`, Redis is stale; clear it and treat as a session boundary. This catches any future code path that might forget to clear Redis on close.
 
 **Enforcement:**
-- Orchestrator's session-creation flow: detect session boundary → DEL `state:tg:{tg_id}` → INSERT new session row → SET new `state:tg:{tg_id}`
-- Memory service's `clear_active_session(tg_id)` is called at session boundaries
+- Orchestrator's session-creation flow at session boundary: DEL `state:tg:{tg_id}` → INSERT new session row → SET new `state:tg:{tg_id}`
+- Memory service's `clear_active_session(tg_id)` is called by every session-close path
+- Memory service's `resolve_session(student_id, tg_id)` runs the staleness check on every turn (cheap; single Postgres PK lookup ~10ms)
 - Working memory cache (`memory:tg:{tg_id}`) is NOT cleared at session boundary — it's a sliding window of recent turns, useful across sessions
 
 ### Principle 4: Webhook idempotency via Telegram update_id
@@ -80,11 +92,13 @@ Telegram retries webhooks if it doesn't get a 200 OK fast enough. Without idempo
 When LLM APIs, databases, or external services fail, the user must see a graceful response — never a crash, never a silent failure.
 
 **Failure-mode matrix:**
-- Planner LLM fails → use safe default classification (`small_talk` + minimal context), continue
-- Generation LLM fails → retry once; if both fail, send canned response: "Hmm, having trouble thinking right now. Try again in a moment?" + button `[Try again]`
-- Database write fails AFTER response delivered → log loud (Sentry), proceed; user sees the response, state is slightly inconsistent but functional
-- Database write fails BEFORE response delivered → fail loud, send canned error to user
-- Redis unavailable → fall back to Postgres for reads; for writes (rate limits, lock), allow request through and log alert
+- **Planner LLM fails** → use safe default classification (`small_talk` + minimal context), continue. Log to `v5.llm_calls` with `success=false`.
+- **Generation LLM fails** (VARC explanation, Mentor response, resume prompt, etc.) → retry once; if both fail, send canned response: "Hmm, having trouble thinking right now. Try again in a moment?" + button `[Try again]`. Stash the original intent in the assistant message's metadata so retry can re-run cleanly. Log to `v5.llm_calls` with `success=false`.
+- **LLM call logging (`v5.llm_calls` insertion) fails** → swallow the exception. The user-facing response is delivered regardless. Logging is observability, not a contract with the user.
+- **Database write fails AFTER response delivered** → log loud (Sentry), proceed; user sees the response, state is slightly inconsistent but functional.
+- **Database write fails BEFORE response delivered** → fail loud, send canned error to user.
+- **Telegram parse error** (HTML parse mode rejects content with stray `<` or `>`) → bus retries the same content WITHOUT `parse_mode`. Always delivers; LLM emphasis tags would render literally, but message lands.
+- **Redis unavailable** → fall back to Postgres for reads; for writes (rate limits, lock), allow request through and log alert.
 
 **Principle:** Better to send a response and have a state hiccup than to crash the user-facing flow.
 
@@ -102,13 +116,96 @@ The tutor brief Redis cache (`profile:brief:{student_id}`) gets stale fast. Note
 
 ---
 
+## Shared Infrastructure (cross-cutting modules)
+
+Three shared modules used by every service. Documented here, in `02_service_contracts.md`, because they're cross-service concerns that belong neither to a specific service nor only to the data model.
+
+### `shared.llm.openrouter.chat_with_metadata(system, user, model) → LLMCallResult`
+
+The canonical LLM call interface for slice 3+ services. Replaces the older content-only wrappers (`llm_call_with_retry`, `llm_call_with_retry_messages`) which still exist for `v4_legacy` compatibility but should not be used in v5 services.
+
+**Input:**
+- `system: str` — the system prompt
+- `user: str` — the user prompt
+- `model: str` — the OpenRouter model identifier (e.g., `"anthropic/claude-haiku-4-5"`, `"anthropic/claude-sonnet-4-5"`)
+
+**Output:** `LLMCallResult` dataclass:
+```python
+@dataclass
+class LLMCallResult:
+    content: str
+    model: str
+    input_tokens: int | None    # populated from OpenRouter usage block when available
+    output_tokens: int | None
+    cost_usd: float | None      # computed from token counts × per-model pricing
+    latency_ms: int             # wall-clock time of the call
+    success: bool               # True on completion; False on exception (caller decides what to do)
+    error_message: str | None
+```
+
+**Behavior:**
+- On success: returns `LLMCallResult` with `success=True`, content populated, tokens/cost populated if OpenRouter returned a usage block.
+- On failure (timeout, network error, malformed response, 5xx): retry once after 500ms backoff. If still failing, returns `LLMCallResult` with `success=False`, `content=""`, `error_message` set. Caller decides what to do (typically: return canned error response with `[Try again]` button per Principle 5).
+
+**Cost computation:** model-aware lookup table in the module. Updated when new models are wired. If a model isn't in the table, `cost_usd` stays None (still logged; just no cost attribution).
+
+### `shared.observability.llm_log.record_llm_call(...)`
+
+Best-effort logger for LLM observability. One row per LLM call, success or failure.
+
+**Signature:**
+```python
+async def record_llm_call(
+    service: str,           # 'orchestrator' | 'varc' | 'mentor' | 'memory'
+    purpose: str,           # see purpose enum in 01_data_model.md llm_calls section
+    result: LLMCallResult,
+    *,
+    student_id: str | None = None,
+    session_id: str | None = None,
+    message_id: str | None = None,
+) -> None
+```
+
+**Behavior:**
+- INSERTs one row into `v5.llm_calls` with all available fields.
+- Wraps the INSERT in try/except. On failure, logs the exception to stdout and returns. The user-facing response is NEVER blocked or affected by logging failure (Principle 5).
+- No retries. No queuing. If Postgres is down, the call is lost; cost analytics will show a gap. Acceptable for v1; revisit for higher SLAs in v1.5+.
+
+**Required by every LLM call site:** Every place in v5 services that calls `chat_with_metadata` MUST call `record_llm_call` immediately after, regardless of success/failure. Pattern:
+
+```python
+result = await chat_with_metadata(system_prompt, user_prompt, MODEL_VARC_TUTOR)
+await record_llm_call(
+    service="varc",
+    purpose="answer_explanation",
+    result=result,
+    student_id=student_id,
+    session_id=session_id,
+    message_id=message_id,  # the message_id of the assistant turn this LLM call produced
+)
+if not result.success:
+    return _error_fallback_response(intent=context.intent, ...)
+# ... use result.content
+```
+
+### `shared.telegram.utils.edit_telegram_keyboard(bot, chat_id, message_id, new_keyboard=None)`
+
+Helper for closing or replacing inline keyboards on previously-delivered Telegram messages. Used by the bus when `response.requires_keyboard_close == True` to remove the inline keyboard from the previous question (Principle 2).
+
+**Behavior:**
+- Calls `editMessageReplyMarkup` on the target message.
+- `new_keyboard=None` clears the keyboard entirely.
+- Catches all errors (message too old, deleted, etc.) — logs warning, returns `False`. Never raises. Never blocks response delivery.
+
+---
+
 ## Service 1: Message Bus
 
 The thinnest service. Pure platform translation. No business logic, no state, no DB writes.
 
 ### `receive_telegram_update(raw_update)`
 
-**Trigger:** Telegram POSTs to `/webhook/{secret}`
+**Trigger:** Telegram POSTs to `/v5/webhook/{secret}`
 
 **Input:** Raw Telegram Update object (JSON)
 
@@ -154,22 +251,43 @@ The thinnest service. Pure platform translation. No business logic, no state, no
 
 **Input:**
 - tg_id: int
-- response: AgentResponse content + keyboard
+- response: AgentResponse (content + keyboard_buttons + requires_keyboard_close + previous_question_message_id)
 - thinking_message_id: int (the "thinking" message to edit)
 
-**Output:** Success boolean
+**Output:** delivered Telegram `message_id` (used by orchestrator to update Redis state with `last_question_message_id` for keyboard-close coordination)
 
 **Side effects:**
-1. Format response for Telegram:
-   - Convert markdown to Telegram MarkdownV2
-   - Build inline keyboard if response.keyboard provided
-   - Chunk if >4096 chars (rare)
-2. Call `bot.editMessageText(thinking_message_id, response.content, parse_mode='MarkdownV2', reply_markup=keyboard)`
-3. If edit fails (message too old, etc.), fall back to `bot.sendMessage`
+
+1. **Close previous question's keyboard** (Principle 2) — if `response.requires_keyboard_close == True` AND `response.meta.previous_question_message_id` is set, call `edit_telegram_keyboard(bot, chat_id, prev_msg_id, new_keyboard=None)` BEFORE delivering the new message. On success or failure, log; do NOT block delivery.
+
+2. **Build inline keyboard** from `response.keyboard_buttons` (the structured 2D array from the agent response). Convert to Telegram's `InlineKeyboardMarkup` shape.
+
+3. **Chunk content if >4096 chars.** Rare in practice; explanation responses are typically <2000 chars. If chunking is needed, send the passage as one message first (no keyboard), then question + keyboard as second message.
+
+4. **Edit or send with HTML parse mode.** Calls `_safe_edit_text(bot, chat_id, thinking_message_id, content, reply_markup)` which:
+   - Tries `edit_message_text(..., parse_mode=ParseMode.HTML)` first
+   - On `BadRequest` with "can't parse entities": retries WITHOUT `parse_mode` (delivers as plain text). Always lands.
+   - Returns the edited message's `message_id`
+   
+   If editing fails for any other reason (message too old, deleted), falls back to `_safe_send_text(bot, chat_id, content, reply_markup)` which has the same parse-mode-with-fallback behavior.
+
+5. **Return delivered message_id** so orchestrator can update Redis state (`last_question_message_id`) for the next keyboard-close cycle.
+
+**HTML parse mode rationale (slice 3 verification fix):**
+
+Originally legacy `Markdown` parse mode was used. Subskill names like `inference_basic` contain underscores; the legacy Markdown parser interprets unmatched `_` as italic markers and rejects the message. HTML parse mode only requires escaping `<`, `>`, `&` — not present in normal English text or subskill names. Far more permissive. (See DECISIONS.md "Markdown rendering: switch from Markdown to HTML parse mode".)
+
+**Two content sources, two handling rules:**
+- **Orchestrator-composed templates** (stats, error fallback, soft-redirect, mid-question doubt ack, session resume prompt header): may contain `<b>`, `<i>`, `<u>`, `<s>`, `<a href>`, `<code>`, `<pre>` — Telegram's HTML-supported tag set. NOT escaped — tags are intentional.
+- **LLM-generated content** (VARC explanations, Mentor responses, resume prompt body): caller MUST run `html.escape()` over the LLM output before passing to bus. Catches stray `<`/`>`/`&` from disobedient LLMs. Bus does not escape — escape responsibility lives at the LLM call site.
 
 **Error handling:**
 - Telegram API errors → retry once with exponential backoff
-- Persistent failure → log and return false (orchestrator already committed memory; user will see no response, but state is consistent)
+- Persistent failure → log and return None (orchestrator already committed memory; user will see no response, but state is consistent)
+
+### `edit_telegram_keyboard(bot, chat_id, message_id, new_keyboard)`
+
+Helper used by send_to_telegram to close keyboards on prior messages (Principle 2). Documented in Shared Infrastructure section above.
 
 ### What the Message Bus does NOT do
 
@@ -605,8 +723,56 @@ elif current_step == 'mentor_synthesis':
 
 ## Service 3: Memory Service
 
-Owns: working memory cache (Redis), episodic_summaries.
+Owns: working memory cache (Redis), episodic_summaries, sessions table writes.
 Reads: messages, sessions.
+
+### `resolve_session(student_id, tg_id) → (session_id, resume_candidate, prior_question_message_id)` — slice 3 entry point
+
+The orchestrator's Step 5 entry point. Encapsulates session-boundary detection, returning-after-break detection, and Principle 3 enforcement. Called BEFORE Step 2 (user message persistence) so the new message can be persisted with the correct `session_id` from the start.
+
+**Input:**
+- `student_id: UUID`
+- `tg_id: int`
+
+**Output:** tuple of:
+- `session_id: UUID` — the session this turn belongs to (new or continuing)
+- `resume_candidate: dict | None` — populated if the previous closed session had unfinished work and `days_since_break <= 14` (Bug 2 support); see `detect_session_resume_candidate` below for shape
+- `prior_question_message_id: int | None` — if a session boundary just fired, this carries the OLD session's `last_question_message_id` so the orchestrator's Step 11.5 can close that keyboard when serving the new session's first question (Principle 2 across boundaries)
+
+**Internal flow:**
+
+1. Read Redis state: `redis_state = await get_active_session(tg_id)`
+
+2. **Defensive staleness check (Principle 3 enforcement):** if `redis_state` exists and points to a `session_id`, verify in Postgres:
+   ```sql
+   SELECT ended_at, last_activity_at FROM v5.sessions WHERE session_id = $1
+   ```
+   If row missing OR `ended_at IS NOT NULL`, Redis is stale (session was closed since Redis was last written). Treat as session boundary: `clear_active_session(tg_id)`, set `redis_state = None`.
+
+3. **Three cases:**
+   
+   **Case A: Continuation** — `redis_state` exists, points to active session, `last_activity_at` is recent (< 30 min):
+   - UPDATE that session: `last_activity_at = now()`, `message_count = message_count + 1` (Bug 1 fix from slice 3 verification — both updates in one statement)
+   - Return `(redis_state['session_id'], None, None)`
+   
+   **Case B: Boundary** — `redis_state` exists, points to active session, `last_activity_at` is stale (>= 30 min):
+   - Capture old session's `last_question_message_id` from `redis_state` (for prior_question_message_id return)
+   - Call `close_session(old_session_id, 'inactivity_timeout')` — this DELs Redis state and triggers the session-end pipeline
+   - Call `detect_session_resume_candidate(student_id)` — returns the candidate dict if old session had unfinished work
+   - Create new session row, set new Redis state via `set_active_session`
+   - Return `(new_session_id, resume_candidate, old_last_question_message_id)`
+   
+   **Case C: No active state** (Redis cleared, evicted, or first message ever):
+   - Check Postgres for the most recent open session (`ended_at IS NULL`) — if found and recent, rehydrate Redis state, treat as continuation (Case A logic)
+   - Otherwise: this is a new session OR the user is returning after a closed session. Call `detect_session_resume_candidate(student_id)`. If candidate exists, treat as boundary (Case B): create new session + return resume_candidate. If no candidate, just create new session.
+
+**Critical invariants:**
+- `session_id` returned is ALWAYS valid (never None). Orchestrator persists user message with this session_id.
+- Redis state is NEVER allowed to point to a closed session after `resolve_session` returns. Any staleness gets cleaned up before return.
+- Only ONE session row per call: continuation reuses existing; boundary closes old + creates new in same operation.
+
+**Notes:**
+- Slice 3 introduces this. Before slice 3, orchestrator had inline session-boundary logic in Step 5 itself. Refactored to memory service for testability and so Principle 3 enforcement lives in one place.
 
 ### `get_recent_turns(student_id, tg_id, limit=20)`
 
@@ -799,8 +965,12 @@ LIMIT $limit
 **Output:** Success
 
 **Internal flow:**
-1. UPDATE sessions SET ended_at = now(), end_reason = ? WHERE session_id = ?
-2. Trigger session-end pipeline (async — see below)
+1. Look up `tg_id` for this session: `SELECT s.tg_id FROM v5.students s JOIN v5.sessions sess ON sess.student_id = s.student_id WHERE sess.session_id = $1`
+2. UPDATE sessions SET ended_at = now(), end_reason = ? WHERE session_id = ?
+3. **DEL `state:tg:{tg_id}` in Redis** (Principle 3 invariant — every session-close path clears Redis)
+4. Trigger session-end pipeline (async — see below)
+
+**Critical:** every caller of `close_session` (cleanup cron, explicit_end handlers, error paths, future slice 4 session-switch path) inherits the Redis cleanup automatically. NO caller should manually skip step 3.
 
 ### Session-End Pipeline (`process_session_end(session_id)`)
 
@@ -845,17 +1015,21 @@ LIMIT $limit
 
 ### Session Cleanup Cron (`cleanup_inactive_sessions`)
 
-**Trigger:** Cron every 10 minutes
+**Trigger:** Cron every 10 minutes (configured externally — Railway cron, cron-job.org, GitHub Actions, etc.)
 
 **Internal flow:**
-1. SQL:
+1. SQL — find inactive sessions, joined with student tg_id:
    ```sql
-   SELECT session_id FROM sessions
-   WHERE ended_at IS NULL
-     AND last_activity_at < now() - interval '45 minutes'
+   SELECT s.session_id, s.student_id, st.tg_id
+   FROM v5.sessions s
+   JOIN v5.students st ON st.student_id = s.student_id
+   WHERE s.ended_at IS NULL
+     AND s.last_activity_at < now() - interval '30 minutes'
    ```
-2. For each session_id:
-   - Call `close_session(session_id, 'inactivity_timeout')`
+2. For each row, call `close_session(session_id, 'inactivity_timeout')`. `close_session` itself handles the Redis state cleanup (per its updated contract above — DELs `state:tg:{tg_id}`).
+3. Returns count of closed sessions.
+
+**Critical: 30-min threshold matches the session-boundary detection logic in `resolve_session`.** Both use `last_activity_at + 30 min` as the cutoff. Any change to one MUST change the other.
 
 ### What Memory Service does NOT do
 
@@ -980,25 +1154,37 @@ Reads: student_skill_profile (the renamed v4 table), messages (for source attrib
 
 **Notes:** Called by orchestrator when constructing AgentContext. Used by VARC agent when `intent.difficulty` from planner is null. ~5ms typical (single SELECT, can be cached briefly with student profile).
 
-### `get_session_stats(student_id, session_id)` — Bug 12
+### `get_session_stats(student_id, session_id=None)` — Bug 12
 
-**Input:** student_id, session_id
+**Input:**
+- `student_id: UUID`
+- `session_id: UUID | None` — slice 3+ provides this; slice 2.5 (before sessions existed) called with None
 
 **Output:** dict with current session stats
 
 **Internal flow:**
-SQL:
+
+If `session_id` is provided (slice 3+ normal case):
 ```sql
 SELECT 
   count(*) FILTER (WHERE answered_at IS NOT NULL AND skipped = false) AS attempted,
   count(*) FILTER (WHERE is_correct = true) AS correct,
   count(*) FILTER (WHERE skipped = true) AS skipped,
   count(*) FILTER (WHERE answered_at IS NULL AND skipped = false) AS open
-FROM student_question_attempts
+FROM v5.student_question_attempts
 WHERE student_id = $1 AND session_id = $2;
 ```
 
-Plus aggregation by subskill (which subskills appeared in this session, accuracy per subskill).
+If `session_id` is None (slice 2.5 fallback for orphaned attempts that predate slice 3's session_id column):
+```sql
+SELECT ... FROM v5.student_question_attempts
+WHERE student_id = $1
+  AND served_at > now() - interval '60 minutes';
+```
+
+This fallback path exists ONLY for backward compatibility with slice 2.5 attempts. New attempts (slice 3+) ALL have session_id populated, so the fallback is rarely exercised. Slice 7 may remove the fallback entirely once we're confident no orphan rows remain.
+
+Plus aggregation by subskill (which subskills appeared, accuracy per subskill).
 
 **Output shape:**
 ```json
@@ -1010,14 +1196,16 @@ Plus aggregation by subskill (which subskills appeared in this session, accuracy
   "accuracy_pct": 67,
   "subskill_breakdown": {
     "inference_basic": {"attempted": 4, "correct": 3, "accuracy": 75},
-    "main_idea": {"attempted": 2, "correct": 1, "accuracy": 50}
+    "main_idea_full_passage": {"attempted": 2, "correct": 1, "accuracy": 50}
   },
   "duration_seconds": 1380,
   "trap_pattern": "out_of_scope (2 times)"
 }
 ```
 
-**Notes:** Used when student taps `[Show my session stats]` continuation button. Pure SQL, no LLM. ~30ms typical.
+**Notes:**
+- Used when student taps `[Show my session stats]` continuation button. Pure SQL, no LLM. ~30ms typical.
+- Orchestrator passes `intent.action == "stats_request"` to this; the response is composed by the orchestrator (not by an agent) using the returned dict. See orchestrator's Step 10 routing for stats_request.
 
 ### `add_note(student_id, note_data)`
 
@@ -1625,8 +1813,8 @@ Consistent across services:
 ```
 # Message Bus
 receive_telegram_update(raw_update) → 200 OK
-send_to_telegram(tg_id, response, thinking_message_id) → bool
-edit_telegram_keyboard(tg_id, message_id, new_keyboard | null) → bool  # for closing old keyboards (Bug 11)
+send_to_telegram(tg_id, response, thinking_message_id) → int  # delivered tg_message_id
+edit_telegram_keyboard(bot, chat_id, message_id, new_keyboard | None) → bool  # close prior keyboard
 
 # Orchestrator
 handle_message(normalized_payload, thinking_message_id) → AgentResponse
@@ -1634,6 +1822,7 @@ handle_onboarding_step(student_id, normalized_payload) → AgentResponse
 check_idempotency(tg_update_id) → bool  # Bug 20
 
 # Memory Service
+resolve_session(student_id, tg_id) → (session_id, resume_candidate, prior_question_message_id)  # slice 3 entry point
 get_recent_turns(student_id, tg_id, limit=20) → [Turn]
 append_turn(student_id, tg_id, turn_data, message_id) → bool
 get_active_session(tg_id) → Session | None
@@ -1644,9 +1833,9 @@ detect_session_resume_candidate(student_id) → ResumeCandidate | None  # Bug 2
 get_episodic_summaries(student_id, filter) → [EpisodicSummary]
 embedding_search_messages(student_id, query, limit=5) → [Message]
 commit_deltas(student_id, tg_id, deltas) → bool
-close_session(session_id, end_reason) → bool
-process_session_end(session_id) → bool  # async pipeline
-cleanup_inactive_sessions() → bool       # cron
+close_session(session_id, end_reason) → bool  # also DELs Redis state for tg_id
+process_session_end(session_id) → bool  # async pipeline; slice 3 stub, slice 7 real
+cleanup_inactive_sessions() → int        # cron; returns count of closed sessions
 
 # Profile Service
 ensure_profile(student_id) → ProfileRow
@@ -1654,7 +1843,7 @@ update_profile(student_id, updates) → ProfileRow
 get_tutor_brief(student_id) → string
 get_minimal_brief(student_id) → string
 get_default_difficulty(student_id) → "easy" | "medium" | "hard"  # Bug 23
-get_session_stats(student_id, session_id) → SessionStats  # Bug 12
+get_session_stats(student_id, session_id=None) → SessionStats  # Bug 12; session_id required slice 3+
 add_note(student_id, note_data) → note_id  # invalidates profile:brief cache
 reinforce_note(note_id) → bool  # invalidates profile:brief cache
 supersede_note(old_note_id, new_note_data) → new_note_id  # invalidates profile:brief cache
@@ -1674,4 +1863,8 @@ inline_observe(student_id, session_id, recent_turn, agent_response) → None  # 
 
 # Planner (sub-component)
 classify(message, recent_turns, active_session_summary) → IntentClassification
+
+# Shared infrastructure (slice 3+)
+chat_with_metadata(system, user, model) → LLMCallResult                              # OpenRouter call w/ tokens+cost+latency
+record_llm_call(service, purpose, result, *, student_id, session_id, message_id) → None  # best-effort
 ```

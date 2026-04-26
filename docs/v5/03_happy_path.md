@@ -19,6 +19,17 @@ Other slice 2.5 changes that affect every trace:
 - LLM/DB failures show graceful fallbacks with `[Try again]` button
 - Active session Redis state cleared on session boundary
 
+**⚠️ Slice 3 + verification update note (2026-04-26):**
+
+Slice 3 introduced sessions, real LLM-generated explanations, and the returning-after-break flow. Verification surfaced three additional fixes that affect every trace going forward:
+
+- **Session boundary is 30 minutes, not 2 hours.** Wherever the original traces say "gap > 2 hours" or "after 2 hours", read "after 30 minutes". Cleanup cron runs every 10 min externally (cron-job.org or Railway cron); inactive sessions actually close 30-40 min after last activity.
+- **Telegram parse mode is HTML, not MarkdownV2.** Wherever the original traces say "Format response with MarkdownV2", read "Format response with HTML; LLM-generated content gets html.escape() before delivery; bus retries without parse_mode on parse error". Subskill names with underscores no longer break rendering.
+- **`v5.sessions.message_count` increments on every turn.** Combined into the same UPDATE that bumps `last_activity_at`. Convention: counts turns (one user msg + one assistant msg = +1).
+- **Session close DELs Redis state in one operation.** The `close_session` function (called by cleanup cron, explicit_end, future session-switch paths) does Postgres update + Redis DEL atomically. Defensive staleness check in `resolve_session` provides layered protection.
+- **Every LLM call logs to `v5.llm_calls`.** Best-effort observability via `record_llm_call`. Every call site MUST log; failures don't impact UX.
+- **Every LLM call uses `chat_with_metadata`.** Returns `LLMCallResult` with content + tokens + cost + latency + success flag. Has retry-once-on-failure built in.
+
 **5 NEW traces are appended at the end of this document** showing:
 - Trace 6: Skip flow
 - Trace 7: Mid-question doubt
@@ -26,7 +37,7 @@ Other slice 2.5 changes that affect every trace:
 - Trace 9: Mid-session stats request
 - Trace 10: LLM API failure with retry
 
-These new traces fully reflect slice 2.5's architecture. When a discrepancy exists between original traces (1-5) and the contracts in `02_service_contracts.md`, **trust the contracts.**
+These new traces fully reflect slice 2.5's architecture. When a discrepancy exists between original traces (1-5) and the contracts in `02_service_contracts.md` or the data model in `01_data_model.md`, **trust the contracts and data model.**
 
 ---
 
@@ -144,8 +155,8 @@ User sends `/start` to bot.
 
 ### Step 8: Bus delivers
 
-- Format response with MarkdownV2 + inline keyboard
-- `bot.editMessageText(thinking_message_id=1, content, ...)` → replaces "🤔 Thinking..." with welcome
+- Format response with HTML parse mode + inline keyboard. (Templated welcome message uses `<b>` for the heading; LLM-generated content from later slices runs through `html.escape()` before bus delivery; bus retries without `parse_mode` if Telegram returns a parse error.)
+- `bot.editMessageText(thinking_message_id=1, content, parse_mode=ParseMode.HTML, ...)` → replaces "🤔 Thinking..." with welcome
 - Release lock: `DEL lock:user:123456789`
 
 **User sees:** Welcome message with "Let's start" button. Total elapsed: ~1.5 seconds (no LLM calls in onboarding FSM, very fast).
@@ -452,12 +463,12 @@ Archit has used dhri for 2 weeks. Has 50+ messages, 6 sessions, several notes. O
 
 - Read Redis: memory:tg:123456789 → 30 recent turns from last sessions
 - Read Redis: state:tg:123456789
-  - Last session ended yesterday → no active state in Redis (cleared by session-end pipeline)
-- last_activity_at from sessions table > 2 hours ago → start new session
-- Create new session: primary_agent='varc' (defaulting; will be confirmed after planner)
+  - Last session ended yesterday → no active state in Redis (cleared by session-close pipeline; per Principle 3 every Postgres session-close path DELs the corresponding Redis key)
+- `resolve_session(student_id, tg_id)` is called as the slice 3+ entry point. It reads Postgres `last_activity_at` for the student's most recent open session, finds it > 30 minutes old (or absent because the cleanup cron already closed it) → triggers session boundary path
+- Boundary path: capture old session's `last_question_message_id` if any (for prior_question_message_id return); call `close_session(old_session_id, 'inactivity_timeout')` if not already closed; call `detect_session_resume_candidate(student_id)` for Bug 2 logic; create new session row; SET new Redis state via `set_active_session`
 - session_id = sess-new-1
-- Update messages.session_id for this turn
-- Set Redis state:tg with new session
+- Update messages.session_id for this turn (the user message persisted in Step 3 gets backfilled with sess-new-1)
+- The orchestrator now has `(session_id, resume_candidate, prior_question_message_id)` from `resolve_session` — uses it through subsequent steps
 
 ### Step 6: Planner LLM call
 
@@ -598,17 +609,21 @@ Compose your response:
 - Be direct, no fluff
 ```
 
-Call MODEL_CHAT (Haiku):
+Call `chat_with_metadata(system_prompt, user_prompt, MODEL_VARC_TUTOR)` — slice 3+ canonical LLM interface:
 - ~2.5s LLM call
-- Returns:
+- Returns `LLMCallResult(content, model, input_tokens, output_tokens, cost_usd, latency_ms, success=True, error_message=None)`
+- After the call returns, `await record_llm_call(service="varc", purpose="answer_explanation", result=result, student_id=..., session_id=..., message_id=...)` — best-effort write to `v5.llm_calls`. Logging failure NEVER blocks delivery (per Principle 5).
+- LLM-generated content is then run through `html.escape()` before being passed to the bus (since the bus uses HTML parse mode for delivery).
+
+The LLM returns:
   ```
   Picking up where we left off — let's keep working on inference. 
   This one's on AI ethics, which I know you like. Watch for out-of-scope 
   options — they've been catching you on comparative passages.
   
-  *Passage:* [Full passage text]
+  Passage: [Full passage text]
   
-  *Question:* Which of the following can be inferred from the author's 
+  Question: Which of the following can be inferred from the author's 
   argument about algorithmic decision-making?
   
   A) [Option A]
@@ -616,6 +631,8 @@ Call MODEL_CHAT (Haiku):
   C) [Option C]
   D) [Option D]
   ```
+
+(Note: the LLM is instructed in its system prompt to output plain text. No `*asterisks*` for emphasis. Word choice carries the weight. Combined with `html.escape()`, this guarantees clean rendering across HTML parse mode.)
 
 ### Step 13: VARC agent returns AgentResponse
 
@@ -1082,10 +1099,10 @@ If even tier 6 fails (zero questions in DB matching anything):
 
 Student opens dhri after 5 days away.
 
-- New session created
-- Planner detects: gap > 2 hours, no current_focus
-- profile + episodic loaded
-- Mentor agent (or VARC with response_guidance.tone='warm') opens with:
+- `resolve_session` detects boundary: gap > 30 min (in fact, 5 days) → close_session if old session still open + create new session + call `detect_session_resume_candidate`
+- profile + episodic summary loaded
+- If a resume candidate exists (unanswered question in last closed session, days_since_break ≤ 14), VARC composes a Sonnet-generated resume prompt with deterministic 3-button continuation row: `[Resume that question]` `[Start fresh]` `[Just chat first]`. See Trace 8 for the full flow.
+- If no resume candidate (e.g., last session ended cleanly with all questions answered), Mentor agent (or VARC with response_guidance.tone='warm') opens with:
   ```
   Welcome back. It's been about 5 days — totally fine, life happens.
   

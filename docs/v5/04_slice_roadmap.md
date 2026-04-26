@@ -12,29 +12,47 @@ The 9 slices below (8 + a retrofit slice) are designed to be implemented across 
 
 ---
 
+## Schema Drift Discipline (binds every slice)
+
+Schema drift is the most common silent bug source. After it bit slice 2 (the `fallback_tier` column was specified in `01_data_model.md` but never created), we instituted a discipline that every slice now follows:
+
+1. **Each slice's "Migrations" subsection lists files + columns explicitly.** Not "create the schema" but "create THIS schema with THESE columns." Claude Code reads the explicit list when planning the migration; missing a column is now visible drift, not an oversight.
+
+2. **CREATE TABLE migrations include ALL columns documented in `01_data_model.md` for that table** — even columns this slice doesn't use. Future-slice columns get sensible defaults (NULL, FALSE, 0). This prevents needing follow-up migrations for columns we already know about.
+
+3. **Run `python -m scripts.check_schema_drift` after every slice's migrations apply.** Compare exit code and output to the slice's expected drift state. STOP and fix before declaring slice done if unexpected drift surfaces.
+
+4. **Migration numbering is sequential and never reused.** Each migration file gets the next number. Even no-op migrations (where `IF NOT EXISTS` makes them idempotent on re-runs) take a number. Gaps in numbering make provenance harder when rebuilding.
+
+5. **Mid-cycle migrations (added between slices) get the next available number.** Migration 015 was added during slice 3 verification to fix the `fallback_tier` drift caught from slice 2. It ships standalone, doesn't disrupt slice 3's planned migrations.
+
+This discipline catches drift in seconds (script call) instead of hours (production debugging).
+
+---
+
 ## Slice Order Overview
 
-| Slice | Goal | Time est | Key capability added |
-|-------|------|----------|----------------------|
-| 1 | Skeleton | 2-3h | All services exist, end-to-end flow works |
-| 2 | Real retrieval | 2-3h | VARC retrieves real questions, scoring works |
-| **2.5** | **Retrofit fixes** | **3-5h** | **Skip button, mid-question doubts, close keyboards, stats, error fallbacks, idempotency** |
-| 3 | Working memory + sessions | 3-4h | LLM explanations, session lifecycle, returning-after-break |
-| 4 | Planner + guardrails | 3-4h | Intent-driven routing, small_talk distinction, out-of-scope |
-| 5 | Profile reads | 2-3h | Personalized responses, default difficulty, empty-state fallbacks |
-| 6 | Onboarding FSM | 3-4h | New-user flow with pause option + diagnostic + synthesis |
-| 7 | Session-end + extraction | 3-4h | Episodic memory + profile note growth |
-| 8 | Mentor + observer | 3-4h | Strategic responses + real-time pattern detection |
+| Slice | Goal | Time est | Key capability added | Status |
+|-------|------|----------|----------------------|--------|
+| 1 | Skeleton | 2-3h | All services exist, end-to-end flow works | ✅ shipped |
+| 2 | Real retrieval | 2-3h | VARC retrieves real questions, scoring works | ✅ shipped |
+| **2.5** | **Retrofit fixes** | **3-5h** | **Skip button, mid-question doubts, close keyboards, stats, error fallbacks, idempotency** | ✅ shipped |
+| 3 | Working memory + sessions | 3-4h | LLM explanations, session lifecycle, returning-after-break | ✅ shipped (incl. verification fixes) |
+| 4 | Planner + guardrails | 3-4h | Intent-driven routing, small_talk distinction, out-of-scope | ⏳ next |
+| 5 | Profile reads | 2-3h | Personalized responses, default difficulty, empty-state fallbacks | — |
+| 6 | Onboarding FSM | 3-4h | New-user flow with pause option + diagnostic + synthesis | — |
+| 7 | Session-end + extraction | 3-4h | Episodic memory + profile note growth | — |
+| 8 | Mentor + observer | 3-4h | Strategic responses + real-time pattern detection | — |
 
-**Total estimated time: 24-33 hours** of focused implementation (slice 2.5 added ~5 hours).
+**Total estimated time: 24-33 hours** of focused implementation. (Slice 3 took longer than estimated due to the markdown render bug + Redis cleanup bug surfacing during verification — both real bugs caught and fixed cleanly.)
 
-If you're working with Claude Code and self-testing in parallel: realistic 3-5 calendar days.
+If you're working with Claude Code and self-testing in parallel: realistic 4-6 calendar days.
 
 **Six architectural principles bind every slice** (documented in detail in `02_service_contracts.md`):
 
 1. Bot NEVER auto-serves a question after answer (diagnostic exception)
 2. Old keyboards must be closed when new question served
-3. Active session state cleared on session boundary
+3. Active session state cleared on session boundary (any code path closing Postgres session clears Redis state)
 4. Webhook idempotency via tg_update_id
 5. UX never breaks on infrastructure failure (graceful fallbacks)
 6. Profile cache invalidation mandatory on writes
@@ -83,6 +101,35 @@ INSERT INTO students (tg_id, display_name, created_at, last_seen_at)
 SELECT tg_id, COALESCE(first_name, 'Student'), created_at, last_seen_at
 FROM tg_users;
 ```
+
+### Migrations (slice 1)
+
+Each migration must include ALL columns specified in `01_data_model.md` for its table — even columns this slice doesn't use yet. Use `IF NOT EXISTS` everywhere for idempotent re-runs.
+
+- `migrations/v5/001_create_v5_schema.sql` — `CREATE SCHEMA IF NOT EXISTS v5;`
+
+- `migrations/v5/002_create_students.sql` — `CREATE TABLE v5.students` with: `student_id`, `tg_id`, `display_name`, `email`, `preferences`, `created_at`, `last_seen_at`, `deleted_at`.
+
+- `migrations/v5/003_create_student_profile.sql` — `CREATE TABLE v5.student_profile` with ALL of: `student_id`, `target_exam`, `target_year`, `target_colleges`, `experience_level`, `preparation_stage`, `hours_per_day`, `why_cat`, `language`, `timezone`, `onboarding_complete`, `onboarding_step`, `onboarding_started_at`, `onboarding_completed_at`, `onboarding_paused_at`, `diagnostic_question_count`, `created_at`, `last_updated`.
+
+- `migrations/v5/004_create_student_notes.sql` — `CREATE TABLE v5.student_notes` per data model.
+
+- `migrations/v5/005_create_messages.sql` — `CREATE TABLE v5.messages` with ALL of: `message_id`, `student_id`, `session_id`, `role`, `content`, `content_type`, `tg_update_id`, `metadata`, `embedding`, `created_at`. Plus the UNIQUE partial index on `tg_update_id WHERE tg_update_id IS NOT NULL`.
+
+- `migrations/v5/006_create_sessions.sql` — `CREATE TABLE v5.sessions` per data model.
+
+- `migrations/v5/007_create_episodic_summaries.sql` — `CREATE TABLE v5.episodic_summaries` per data model.
+
+- `migrations/v5/008_create_observer_events.sql` — `CREATE TABLE v5.observer_events` per data model.
+
+- `migrations/v5/009_create_scheduled_messages.sql` — `CREATE TABLE v5.scheduled_messages` per data model (skeleton table for v2).
+
+**Schema drift verification at end of slice 1:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected output: `student_question_attempts` and `llm_calls` show as missing (those tables land in slices 2 and 3). All other tables `[OK]`.
 
 ### Manual test
 
@@ -136,6 +183,19 @@ Replace random question selection with the existing v4 retrieval pipeline (pgvec
 - Episodic still empty
 - Session lifecycle still not implemented
 
+### Migrations (slice 2)
+
+- `migrations/v5/010_create_student_question_attempts.sql` — `CREATE TABLE v5.student_question_attempts` with ALL of: `id`, `student_id`, `question_id`, `session_id`, `served_at`, `answered_at`, `is_correct`, `student_answer`, `skipped`, `explanation_shown`, `is_diagnostic`, `fallback_tier`. Indexes per data model: `(student_id, served_at DESC)`, `(student_id, answered_at) WHERE answered_at IS NULL`, `(student_id, question_id)`, partial on `is_diagnostic = true`, partial on `fallback_tier IS NOT NULL`, partial on `skipped = true`.
+
+**Note (slice 3 retrospective):** the original slice 2 migration shipped without `fallback_tier` and `is_diagnostic` columns despite the data model spec'ing them. This was caught during slice 3 verification and patched mid-cycle as `migrations/v5/015_add_fallback_tier_to_attempts.sql`. The remaining gaps (`is_diagnostic` plus two `student_profile` columns) get fixed by `migrations/v5/016_onboarding_columns.sql` in slice 6. **Going forward**, every migration's column list MUST be checked against the data model.
+
+**Schema drift verification at end of slice 2:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected output: `llm_calls` shows as missing (lands in slice 3). All other tables `[OK]`. **If drift surfaces because of missing columns on tables that exist: STOP and add the missing columns via a follow-up migration before declaring slice 2 done.**
+
 ### Manual test
 
 1. Restart, send "give me a question"
@@ -159,10 +219,11 @@ Replace random question selection with the existing v4 retrieval pipeline (pgvec
 
 - [ ] Real questions retrieved, not random
 - [ ] No repeat questions (within seen set)
-- [ ] Fallback tier logged in metadata
+- [ ] Fallback tier logged in `messages.metadata` AND `v5.student_question_attempts.fallback_tier` (the column landed in migration 015 mid-cycle)
 - [ ] Question presentation includes passage when applicable
 - [ ] Inline keyboard with A/B/C/D works (taps registered, even if not yet processed)
 - [ ] Response time < 5 seconds
+- [ ] Schema drift checker passes per the expected drift state above
 
 ### Estimated time: 2-3 hours
 
@@ -196,10 +257,18 @@ See `slice_2_5_retrofit.md` for the full Claude Code prompt and detailed manual 
 - Mentor still stub (slice 8)
 - Mid-question doubt response is hardcoded ack (slice 4 makes it LLM-driven)
 
-### Migrations
+### Migrations (slice 2.5)
 
-- `011_add_skipped_to_attempts.sql`: ADD COLUMN skipped BOOLEAN DEFAULT FALSE
-- `012_add_tg_update_id_to_messages.sql`: ADD COLUMN tg_update_id BIGINT + UNIQUE partial index
+- `migrations/v5/011_add_skipped_to_attempts.sql` — `ADD COLUMN IF NOT EXISTS skipped BOOLEAN DEFAULT FALSE` to `v5.student_question_attempts`. Plus partial index on `skipped = true`. (Slice 2's CREATE TABLE should have included this column inline; if it did, migration 011 is a no-op via `IF NOT EXISTS`. Either way it ships and gets recorded.)
+
+- `migrations/v5/012_add_tg_update_id_to_messages.sql` — `ADD COLUMN IF NOT EXISTS tg_update_id BIGINT` to `v5.messages`. Plus UNIQUE partial index `WHERE tg_update_id IS NOT NULL`. Same `IF NOT EXISTS` story.
+
+**Schema drift verification at end of slice 2.5:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected output: `llm_calls` shows as missing (lands in slice 3). All other tables `[OK]`.
 
 ### Six architectural principles enshrined
 
@@ -239,62 +308,89 @@ Make conversation feel continuous. Recent turns flow into LLM context. Sessions 
 
 ### What's real (added on top of slice 2.5)
 
-- **Sessions auto-management:** Session created on first message after 30-min gap. Updated on every turn (`last_activity_at`, `message_count`). Closed by `/admin/cleanup` cron after 30 min inactivity.
-- **Memory service real:** `append_turn` (Postgres source of truth + Redis LIST cache, 24h TTL, 50 items max). `get_recent_turns` (Redis-first with Postgres fallback, repopulates cache). `get_active_session`, `set_active_session`, `update_active_session`, `clear_active_session`.
-- **Session boundary state clearing (Principle 3, Bug 13):** When a new session starts, orchestrator DELs `state:tg:{tg_id}` BEFORE creating new state. domain_state from closed session never leaks.
-- **Returning-after-break feature (Bug 2):** New `memory_service.detect_session_resume_candidate(student_id)`. When a closed session has unanswered work and student returns within 14 days, VARC composes a resume prompt: "Welcome back. Last time we were on a {subskill} question — want to pick that up, or start fresh?" Buttons: `[Resume that question]` `[Start fresh]` `[Just chat first]`.
+- **Sessions auto-management:** Session created on first message after 30-min gap. Updated on every turn (`last_activity_at`, `message_count`). Closed by `/admin/v5/cleanup-sessions` endpoint, hit by external cron every 10 min.
+- **Memory service real:** `append_turn` (Postgres source of truth + Redis LIST cache, 24h TTL, 50 items max). `get_recent_turns` (Redis-first with Postgres fallback, repopulates cache). `get_active_session`, `set_active_session`, `update_active_session`, `clear_active_session`. New `resolve_session(student_id, tg_id)` is the slice 3 entry point — returns `(session_id, resume_candidate, prior_question_message_id)`.
+- **Session boundary state clearing (Principle 3, Bug 13):** When a new session starts, orchestrator DELs `state:tg:{tg_id}` BEFORE creating new state. domain_state from closed session never leaks. Layered: `cleanup_inactive_sessions` clears Redis proactively for each session it closes; `resolve_session` does defensive verification on every turn.
+- **Returning-after-break feature (Bug 2):** New `memory_service.detect_session_resume_candidate(student_id)`. When a closed session has unanswered work and student returns within 14 days, VARC composes a resume prompt with Sonnet (warmth): "Welcome back. Last time we were on a {subskill} question — want to pick that up, or start fresh?" Buttons (deterministic): `[Resume that question]` `[Start fresh]` `[Just chat first]`.
 - **VARC explanations LLM-generated:** Replaces slice 2's hardcoded explanation strings. MODEL_VARC_TUTOR (Haiku 4.5). System prompt includes Principle 1 enforcement ("never include a new question in your response").
-- **Cost/latency tracking:** New `v5.llm_calls` table logs every LLM call (service, model, tokens, cost, latency, success). Migration 013.
+- **Cost/latency tracking via `v5.llm_calls` table:** Every LLM call logs one row. New shared modules: `chat_with_metadata` (the canonical LLM interface) and `record_llm_call` (best-effort observability).
+- **Old-session keyboard close on new question serve:** When a session boundary fires + a new question is served, orchestrator closes the OLD session's last question's keyboard (via `prior_question_message_id` carried forward by `resolve_session`).
+
+### Slice 3 verification fixes (landed mid-cycle)
+
+Three issues surfaced during Phase A/B verification testing:
+
+- **Markdown rendering broken** — orchestrator-composed responses (stats, etc.) used legacy Markdown parse mode. Subskill names (`inference_basic`) contain underscores; legacy Markdown parser interprets `_` as italic markers and rejected the message. Fixed by switching the bus to HTML parse mode with bus-side fallback to plain text on parse error. LLM-generated content now goes through `html.escape()` before delivery.
+
+- **`v5.sessions.message_count` never incremented** — orchestrator's per-turn UPDATE bumped `last_activity_at` but not `message_count`. Fixed by combining into a single UPDATE; both fields now move together.
+
+- **`cleanup_inactive_sessions` didn't clear Redis** — closed Postgres sessions but left `state:tg:{tg_id}` stale until next user message arrived. Fixed by making `close_session` (called by cleanup) the single source of truth: Postgres update + Redis DEL in one operation. Also added a defensive staleness check in `resolve_session` for layered protection.
 
 ### What's stubbed (still)
 
 - Planner still hardcoded with simple regex routing (slice 4)
 - Profile brief still hardcoded minimal (slice 5)
-- Episodic summaries still stubbed; cleanup just closes sessions, doesn't generate summaries (slice 7)
+- Episodic summaries still stubbed; `process_session_end` is a no-op (slice 7 wires it)
 - Mentor still stub (slice 8)
 - Onboarding still skipped (slice 6)
+- `v5fail` test trigger still in VARC (slice 4 removes it once real LLM error handling is wired around planner)
+
+### Migrations (slice 3)
+
+- `migrations/v5/013_create_llm_calls.sql` — `CREATE TABLE v5.llm_calls` with ALL of: `id`, `student_id`, `session_id`, `message_id`, `service`, `model`, `purpose`, `input_tokens`, `output_tokens`, `cost_usd`, `latency_ms`, `success`, `error_message`, `created_at`. Indexes: `(student_id, created_at DESC)`, `(service, model)`, partial on `success = false`.
+
+- `migrations/v5/014_add_session_id_to_attempts.sql` — `ADD COLUMN IF NOT EXISTS session_id UUID` (FK to `v5.sessions`, nullable, ON DELETE SET NULL) to `v5.student_question_attempts`. Plus partial index for session-scoped unanswered queries.
+
+- `migrations/v5/015_add_fallback_tier_to_attempts.sql` — **Mid-cycle correction.** Adds `fallback_tier SMALLINT` to `v5.student_question_attempts` after schema audit caught the gap from slice 2's incomplete CREATE TABLE. The retrieval ladder was already computing the tier and surfacing it in `messages.metadata`; this migration also lands it on the attempts row for analytics. See DECISIONS.md and `slice_2_5_retrofit.md`-era notes for context.
+
+**Schema drift verification at end of slice 3:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected output: 3 columns missing on `student_profile` (`onboarding_paused_at`, `diagnostic_question_count`) and `student_question_attempts` (`is_diagnostic`). These are slice 6's territory; will land with migration 016. Exit code 1 (drift exists, but expected). **If the script reports any OTHER drift, STOP and fix before declaring slice 3 done.**
 
 ### Manual test
 
 1. Send "give me an inference question"
 2. Expected: Question presented, session created in DB
 3. Tap a button (any option)
-4. Expected: Explanation of correct/wrong, attempt recorded, next question presented
+4. Expected: LLM-generated explanation of correct/wrong, attempt recorded, **5-button continuation row** (no auto-served next question).
 5. Answer 3 questions
 6. Send "what was that last question about?"
-7. Expected: Bot uses recent turns context to reference the question (not perfectly without profile, but recognizes the topic)
+7. Expected: Bot uses recent turns context to reference the question
 8. Check Postgres:
    ```sql
-   SELECT * FROM sessions WHERE student_id = ?; 
-   -- 1 active session
+   SELECT * FROM v5.sessions WHERE student_id = ? ORDER BY started_at DESC LIMIT 1;
+   -- 1 active session, message_count > 0
    
-   SELECT count(*) FROM attempts WHERE student_id = ? AND attempted_at > now() - interval '10 min';
-   -- 3 attempts
+   SELECT count(*) FROM v5.student_question_attempts WHERE student_id = ? AND served_at > now() - interval '10 min';
+   -- attempts present, all with session_id populated, all with fallback_tier set
    
-   SELECT message_count, question_count, correct_count FROM sessions WHERE ended_at IS NULL;
-   -- ~7-8 messages, 3 questions, however many correct
+   SELECT service, purpose, count(*) FROM v5.llm_calls WHERE student_id = ? GROUP BY service, purpose;
+   -- should see varc/answer_explanation, varc/skip_explanation rows
    ```
-9. Check Redis:
-   ```
-   GET state:tg:{tg_id}
-   -- Should show active session with current_question, questions_answered
-   ```
+9. Check Redis: `GET state:tg:{tg_id}` shows active session with `last_question_message_id`, `last_question_attempt_id`.
+10. Trigger boundary: age the session, hit `/admin/v5/cleanup-sessions`. Verify session closed in Postgres AND Redis state cleared.
+11. Send "hi" → resume prompt appears (Bug 2). Tap [Resume] → original question re-served in new session.
 
 ### Completion criteria
 
 - [ ] Sessions auto-create on 30-min gap
-- [ ] Each turn updates session metadata
-- [ ] Answers + skips processed correctly (preserved from slice 2.5)
+- [ ] Each turn updates session metadata (`last_activity_at` AND `message_count` in same UPDATE)
+- [ ] Answers + skips processed correctly with LLM-generated explanations (preserved from slice 2.5 + new in slice 3)
 - [ ] Recent turns visible in context (LLM responses reference them naturally)
 - [ ] Active session persists across messages
-- [ ] domain_state in Redis has current question, last_question_message_id
-- [ ] **Session boundary clears Redis state (Bug 13):** old domain_state gone after new session starts
+- [ ] domain_state in Redis has current question, last_question_message_id, last_question_attempt_id
+- [ ] **Session boundary clears Redis state (Bug 13):** `cleanup_inactive_sessions` AND `resolve_session` both enforce this; layered defense
 - [ ] **Returning-after-break works (Bug 2):** unanswered question + 30+ min gap + new message → resume prompt with [Resume] [Start fresh] [Just chat]
 - [ ] **No regression:** all slice 2.5 fixes still work (skip, mid-question doubt, close keyboards, stats button, error fallback, idempotency)
-- [ ] LLM call costs logged in `v5.llm_calls`
-- [ ] /admin/cleanup cron runs, closes inactive sessions
+- [ ] **HTML parse mode rendering correct:** stats response shows bold header, no raw asterisks (slice 3 verification fix)
+- [ ] LLM call costs logged in `v5.llm_calls` for every call
+- [ ] External cron (Railway, cron-job.org, etc.) hits `/admin/v5/cleanup-sessions` every 10 min, closes inactive sessions, clears Redis
+- [ ] Schema drift checker passes per the expected drift state above
 
-### Estimated time: 3-4 hours
+### Estimated time: 3-4 hours (actual was longer due to 2 verification bugs)
 
 ---
 
@@ -354,6 +450,19 @@ Real intent-driven routing. Single planner LLM call (Gemini Flash) replaces hard
 - [ ] Response guidance passes through to agents
 - [ ] **No regression:** all slice 1-3 + 2.5 behavior preserved
 - [ ] Default to `small_talk` on planner failure (NOT practice_request) — verify by temporarily breaking planner key
+- [ ] `v5fail` test trigger removed from VARC (real LLM failure handling now wraps the actual openrouter call)
+- [ ] Schema drift checker output matches expected (same as end-of-slice-3)
+
+### Migrations (slice 4)
+
+None new. Slice 4 is pure code (planner LLM + routing + LLM error handling around real calls). No schema changes.
+
+**Schema drift verification at end of slice 4:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected: same 3 missing columns as end-of-slice-3 (slice 6 territory). No NEW drift introduced by slice 4.
 
 ### Estimated time: 3-4 hours
 
@@ -428,6 +537,30 @@ WHERE student_id = 'your-uuid';
 - [ ] Performance stats from `v5.student_question_attempts` included
 - [ ] **No regression:** all slice 1-4 + 2.5 behavior preserved
 - [ ] Total response time still < 5 seconds (cache helps)
+- [ ] Schema drift checker output matches expected
+
+### Migrations (slice 5)
+
+Slice 5 may need to create `v5.student_skill_profile` if not already present. Verify first:
+
+```sql
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema='v5' AND table_name='student_skill_profile';
+```
+
+If 0 (table doesn't exist):
+- `migrations/v5/0XX_create_student_skill_profile.sql` — Create `v5.student_skill_profile` per data model. **Include all columns documented** in `01_data_model.md`. Use the next available migration number after slice 4's last migration.
+
+If table already exists, no migrations.
+
+After applying, update `scripts/check_schema_drift.py`'s EXPECTED dict to include `student_skill_profile`.
+
+**Schema drift verification at end of slice 5:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected: same 3 missing columns as end-of-slice-3/4 (slice 6 territory). If slice 5 added `student_skill_profile`, that table should show `[OK]`.
 
 ### Estimated time: 2-3 hours
 
@@ -448,9 +581,7 @@ New users go through full onboarding: profile fields + optional 5-question diagn
 - **VARC diagnostic mode (auto-continue exception to Principle 1):** During Q1-Q4, after answer/skip, scoring + brief explanation + AUTO-SERVE next diagnostic question. NO continuation buttons during diagnostic. Q5: scoring + transition message + trigger mentor_synthesis. Skip button still works during diagnostic.
 - **Mentor `synthesize_diagnostic`:** Sonnet 4.5. Inputs: profile + 5 diagnostic attempts. Output: warm 3-4 paragraph synthesis ending with deterministic 4-button continuation row: `[Practice my weakest]` `[Explore my strongest]` `[Ask DHRI a question]` `[Just chat first]`.
 - **Mentor `handle_skip_diagnostic`:** For students who skip diagnostic. Shorter synthesis. Buttons: `[Start with easy inference]` `[Pick my own focus]` `[Just chat]`.
-- **Post-onboarding session boundary (Bug 24):** When mentor synthesis completes, the onboarding session is closed (`ended_at = now`, `end_reason = 'onboarding_complete'`). DEL `state:tg:{tg_id}` (Principle 3). Next message starts a fresh session, normal practice flow. Diagnostic attempts (`is_diagnostic = true`) DO count toward stats but are flagged for analytics.
-- **Migration 014_onboarding_columns.sql:** Adds `onboarding_paused_at`, `diagnostic_question_count` to `v5.student_profile` (if not already present from slice 1).
-
+- **Post-onboarding session boundary (Bug 24):** When mentor synthesis completes, the onboarding session is closed (`ended_at = now`, `end_reason = 'onboarding_complete'`). The `close_session` call DELs Redis state automatically (Principle 3). Next message starts a fresh session, normal practice flow. Diagnostic attempts (`is_diagnostic = true`) DO count toward stats but are flagged for analytics.
 
 ### What's stubbed (still)
 
@@ -458,18 +589,37 @@ New users go through full onboarding: profile fields + optional 5-question diagn
 - Mentor's reactive responses for "review_progress" etc.: slice 8
 - Mentor observer mode: slice 8
 
+### Migrations (slice 6)
+
+- `migrations/v5/016_onboarding_columns.sql` — adds the 3 columns the onboarding FSM needs that weren't created in earlier slices' CREATE TABLEs:
+  - `student_profile.onboarding_paused_at TIMESTAMP WITH TIME ZONE` (Bug 6 — pause option)
+  - `student_profile.diagnostic_question_count SMALLINT DEFAULT 0` (counter for diagnostic Q1-Q5)
+  - `student_question_attempts.is_diagnostic BOOLEAN DEFAULT FALSE` (analytics flag for diagnostic attempts)
+  - Plus partial index on `is_diagnostic = true`
+  
+  All `ADD COLUMN IF NOT EXISTS`. Existing rows: `paused_at NULL`, `count 0`, `is_diagnostic FALSE`. No backfill needed.
+
+If by the time slice 6 runs, slice 1's migration 003 had ALREADY included `onboarding_paused_at` and `diagnostic_question_count` (per the updated data model), migration 016 only adds `is_diagnostic` — the other two are no-ops thanks to `IF NOT EXISTS`. Either way the migration ships and is recorded.
+
+**Schema drift verification at end of slice 6:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected output: ALL tables `[OK]`. Exit code 0. **If any drift remains, STOP and fix before declaring slice 6 done.** This is the slice that brings the schema fully aligned with the data model.
+
 ### Manual test
 
 1. **Reset your test user** to mimic new student:
    ```sql
-   UPDATE student_profile SET onboarding_complete = false, onboarding_step = null,
+   UPDATE v5.student_profile SET onboarding_complete = false, onboarding_step = null,
        target_year = null, experience_level = null, /* ... reset all */ 
    WHERE student_id = 'your-uuid';
    
-   DELETE FROM student_notes WHERE student_id = 'your-uuid';
-   DELETE FROM messages WHERE student_id = 'your-uuid';
-   DELETE FROM sessions WHERE student_id = 'your-uuid';
-   DELETE FROM attempts WHERE student_id = 'your-uuid';
+   DELETE FROM v5.student_notes WHERE student_id = 'your-uuid';
+   DELETE FROM v5.messages WHERE student_id = 'your-uuid';
+   DELETE FROM v5.sessions WHERE student_id = 'your-uuid';
+   DELETE FROM v5.student_question_attempts WHERE student_id = 'your-uuid';
    ```
 2. Restart services
 3. Send `/start`
@@ -487,7 +637,7 @@ New users go through full onboarding: profile fields + optional 5-question diagn
 7. Expected: After Q5, immediately receive a synthesis message from mentor
 8. Check Postgres:
    ```sql
-   SELECT * FROM student_profile WHERE student_id = 'your-uuid';
+   SELECT * FROM v5.student_profile WHERE student_id = 'your-uuid';
    -- onboarding_complete=true, all fields populated
    
    SELECT count(*) FROM attempts WHERE student_id = 'your-uuid';
@@ -559,6 +709,18 @@ When sessions end, generate episodic summaries and extract profile notes via sin
 - [ ] LLM call cost ~$0.005 per session (Gemini Flash, single combined call)
 - [ ] Returning-after-break logic (slice 3) works with new episodic data
 - [ ] **No regression:** all slice 1-6 + 2.5 behavior preserved
+- [ ] Schema drift checker passes — all `[OK]`
+
+### Migrations (slice 7)
+
+None new. Slice 7 is pure code (extractor + episodic summary writes use existing `v5.episodic_summaries` and `v5.student_notes` tables created in slice 1).
+
+**Schema drift verification at end of slice 7:**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected: ALL tables `[OK]`. No drift (slice 6 already eliminated remaining drift).
 
 ### Estimated time: 3-4 hours
 
@@ -637,6 +799,18 @@ Mentor agent fully functional. Strategic queries get real responses. Observer de
 - [ ] Mentor uses MODEL_MENTOR (Sonnet 4.5)
 - [ ] Async post-processing doesn't add user-visible latency
 - [ ] **No regression:** all slice 1-7 + 2.5 behavior preserved
+- [ ] Schema drift checker passes — all `[OK]`
+
+### Migrations (slice 8)
+
+None new. Slice 8 is pure code (mentor agent + observer use existing `v5.observer_events` table created in slice 1).
+
+**Schema drift verification at end of slice 8 (the v1 ship gate):**
+```bash
+.venv/bin/python -m scripts.check_schema_drift
+```
+
+Expected: ALL `[OK]`. No drift. **At v1 ship: schema must match data model exactly. No deferred drift remaining.**
 
 ### Estimated time: 3-4 hours
 

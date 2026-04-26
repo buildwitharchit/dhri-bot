@@ -545,6 +545,513 @@ The agents' LLM is told NOT to include questions, options, or buttons in their o
 
 ---
 
+# DECISIONS.md — Additions for Slices 2, 2.5, 3
+
+These entries should be appended to your existing `DECISIONS.md` on the v5 branch (then merged to main after slice 3 verification completes). They capture the architectural decisions that emerged from slice 2 verification, slice 2.5 retrofit, slice 3 implementation, and slice 3 verification fixes.
+
+The entries are in chronological order of when each decision was made. Append all of them at the end of the existing DECISIONS.md, before any HTML comment template.
+
+---
+
+## Slice 2 entries (logged retroactively after slice 3 verification surfaced the omission)
+
+These weren't recorded when slice 2 originally shipped; documenting now because they're load-bearing decisions for downstream slices.
+
+---
+
+### 2026-04-25 — Slice 2 verified: 6-tier retrieval ladder + answer scoring
+
+**Status:** Decided  
+**Slice / Phase:** Slice 2
+
+**Decision:** VARC's question retrieval is a 6-tier fallback ladder, not a single retrieval call. Each tier broadens what counts as an acceptable question:
+
+1. Exact subskill + difficulty + unseen + difficulty-balanced (preferred)
+2. Exact subskill + unseen (any difficulty)
+3. Adjacent subskill + unseen (e.g., inference_basic ↔ inference_advanced)
+4. Any subskill + unseen
+5. Stale-seen (subskill match, served > 14 days ago) with acknowledgement string
+6. Oldest-seen (any subskill, oldest served_at) with acknowledgement string
+
+Tiers 5 and 6 prepend a transparency string ("We've seen this passage before — let's try it with fresh eyes." / "I'm running low on new questions in this category — let me serve one we did a while back to see how your thinking has changed."). Students always get a question; the retrieval ladder never returns null.
+
+Stale button taps (tapping a letter on an old question whose newer question is now active) route to the most recent unanswered attempt — not to the question whose buttons were tapped. This was important until slice 2.5 added keyboard closing; with slice 2.5, old keyboards are removed entirely, making stale taps physically impossible. The fallback logic remains as defense in depth.
+
+**Why:** Question banks have finite content. A student who answers many inference questions will eventually exhaust the unseen pool. The ladder ensures the bot always has *something* to serve, with transparency about why a familiar question is appearing.
+
+**Rejected alternatives:**
+- **Single retrieval call returning null on exhaustion:** rejected because students would hit dead ends after 50-100 questions.
+- **Generate questions on-the-fly:** rejected because LLM-generated questions don't match real CAT difficulty/style; we'd lose the question-bank quality.
+- **Tier acknowledgements as variable LLM-generated text:** rejected for consistency; the deterministic strings are clearer and avoid LLM cost.
+
+**Tradeoffs accepted:**
+- Tier 5/6 acknowledgements may feel apologetic. Acceptable; honesty > pretending we have infinite content.
+- Six tiers is more code than a single retrieval. Each tier is a thin SQL query; total complexity is ~150 lines. Maintainable.
+
+**Revisit when:** Question bank exceeds ~500 questions per subskill (currently ~50). At that point, tiers 5/6 will rarely fire and we can simplify.
+
+---
+
+### 2026-04-25 — Slice 2 verified: separate v5.student_question_attempts table
+
+**Status:** Decided  
+**Slice / Phase:** Slice 2
+
+**Decision:** v5 introduces a fresh `v5.student_question_attempts` table for tracking question serves and answers. The v4 `public.attempts` table is left as-is, holding historical v4 data. v5 services do NOT write to `public.attempts`.
+
+This contradicts an earlier draft of the design doc that said "Add session_id column to attempts." The retroactive decision: don't touch v4 tables.
+
+**Why:** Modifying v4's schema during the v5 build risks v4 functionality (which we keep alive for rollback). A fresh v5 table:
+- Is truly append-only (no risk to v4)
+- Has fields v5 needs that v4 doesn't (skipped, is_diagnostic, fallback_tier, session_id)
+- Doesn't require backfilling historical data into a new column shape
+- After v4 is retired, v4.attempts can be archived or analyzed for historical signal; v5 owns the present
+
+**Rejected alternatives:**
+- **Add columns to public.attempts in v4:** rejected for v4-functionality risk and the strangler-fig discipline.
+- **Migrate public.attempts to v5.student_question_attempts:** rejected because backfilling fields v4 doesn't have creates fake data.
+- **Use one unified table for v4 + v5:** rejected because v4 and v5 have different semantics (v4 has trap analysis, v5 has tier info); merging adds complexity for no benefit.
+
+**Tradeoffs accepted:**
+- Two parallel attempts tables for the duration of v4's life. Both readable; both searchable for analytics. After v4 retirement, the historical v4.attempts can be archived or kept read-only.
+- Slight schema duplication. Acceptable.
+
+**Revisit when:** v4 is fully retired and we decide to consolidate.
+
+---
+
+### 2026-04-25 — Slice 2 verified: webhook auto-registration on deploy
+
+**Status:** Decided  
+**Slice / Phase:** Slice 2
+
+**Decision:** On Railway deploy, the v5 service auto-registers its webhook with Telegram (POST to `/setWebhook`) at startup, pointing to `/v5/webhook/{secret}`. This replaces v4's manual webhook setup during slice 2's "switching webhook to v5" step.
+
+**Why:** Removes a manual step from every deploy. Without this, every Railway redeploy would require us to manually re-register the webhook, which is error-prone (forgotten registrations cause silent traffic loss).
+
+**Rejected alternatives:**
+- **Manual setWebhook via curl after each deploy:** rejected for fragility.
+- **Single one-time setup script:** rejected because Railway's container model means startup happens fresh each deploy; doing it inline at startup is more reliable.
+
+**Tradeoffs accepted:**
+- Adds ~200ms to startup. Acceptable.
+- Multiple instances on the same secret would race to setWebhook; Telegram handles this idempotently.
+
+**Revisit when:** We move to a multi-region or load-balanced deploy. At that point we'd need to handle webhook registration more carefully.
+
+---
+
+## Slice 2.5 entries
+
+These captured the architectural review that surfaced 25 issues, the seven-fix retrofit, and the principles that came out of the review.
+
+---
+
+### 2026-04-25 — Six architectural principles enshrined as cross-service invariants
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5 architectural review
+
+**Decision:** Six principles now bind every service in v5. They are documented in detail at the top of `docs/v5/02_service_contracts.md`. Summarized:
+
+1. **No auto-serve after answer.** The bot never auto-serves a question after a student answers/skips. Continuation buttons let the student choose. (Diagnostic test mode is the bounded exception.)
+2. **Old keyboards must be closed.** When a new question is served, orchestrator removes the inline keyboard from the previous question via Telegram's editMessageReplyMarkup.
+3. **Active session state cleared on boundary.** When a session closes, `state:tg:{tg_id}` is deleted. Strengthened in slice 3: any code path closing a Postgres session MUST clear Redis state in the same operation.
+4. **Webhook idempotency via tg_update_id.** Duplicate Telegram retries are detected and short-circuited. UNIQUE partial index enforces this at the DB level.
+5. **UX never breaks on infrastructure failure.** Every failure mode has a graceful fallback: planner failure → safe default; LLM failure → retry once + canned error with [Try again]; DB failure → log+continue (post-delivery) or fail loud (pre-delivery).
+6. **Profile cache invalidation mandatory on writes.** ANY service writing to student_notes, student_profile, or student_skill_profile MUST DEL `profile:brief:{student_id}`.
+
+**Why:** During slice 2 verification, a UX bug surfaced (bot auto-serving questions after answers) that violated an unwritten design principle. Auditing for similar bugs revealed 25 issues, of which seven required immediate fixes in slice 2.5 and the rest got distributed across remaining slices or deferred to v1.5. The lesson: implicit principles need to be made explicit, or the AI implementing them will optimize the literal spec at the expense of felt experience.
+
+**Rejected alternatives:**
+- **Document principles only in slice prompts:** rejected because principles need to bind the architecture, not be re-litigated per slice.
+- **Treat each bug as a one-off fix:** rejected because the bugs share a pattern. Naming the underlying principles ensures future slices don't reintroduce equivalent bugs.
+
+**Tradeoffs accepted:**
+- Implementation now requires checking principles on every code change. Slight overhead for big payoff in consistency.
+- The principles add ~150 lines to service contracts. Worth it; they're the backbone of v5's "feels coherent" property.
+
+**Revisit when:** A new principle emerges that should be added (e.g., from real-user feedback). Treat additions as architecturally significant — log here, don't drop into a service contract section silently.
+
+---
+
+### 2026-04-25 — Slice 2.5 retrofit: seven fixes that should have been in slice 2
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5
+
+**Decision:** Slice 2's base implementation (6-tier retrieval + answer scoring + continuation buttons) was verified working. Before slice 3 began, slice 2.5 retrofitted seven fixes:
+
+1. **Skip button** on question keyboards (Bug 8)
+2. **Mid-question doubt detection** with back/skip/different-doubt buttons (Bug 1)
+3. **Close old keyboards** when serving new question (Bug 11, Principle 2)
+4. **Show my stats button** + `get_session_stats` function (Bug 12)
+5. **LLM API failure user-facing fallback** with `[Try again]` button (Bug 18)
+6. **DB write failure handling** per Principle 5 (Bug 19)
+7. **Webhook idempotency** via tg_update_id (Bug 20)
+
+**Why:** Each of these was caught during slice 2 architectural review. Fixes 1-4 are UX-breaking in slice 2's current form. Fixes 5-7 are reliability foundations that subsequent slices depend on. Retrofitting now cost less than retrofitting after slice 8.
+
+**Rejected alternatives:**
+- **Defer all 7 fixes to v1.5:** rejected because slices 3-8 will build on the broken base.
+- **Fix only the 4 UX bugs:** rejected because reliability bugs have higher cost of late discovery.
+- **Spread fixes across slices 3-5:** rejected because it muddles slice scoping.
+
+**Tradeoffs accepted:**
+- Adds ~5-7 hours of work between slices 2 and 3. Acceptable given the cost-of-deferral.
+- Two new migrations (011 skipped column, 012 tg_update_id index). Both append-only, idempotent.
+
+**Revisit when:** Verification reveals a fix didn't work or introduced regressions.
+
+---
+
+### 2026-04-25 — 17 of 25 architectural review bugs deferred to subsequent slices or v1.5
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5 architectural review
+
+**Decision:** Of 25 bugs caught during architectural review, 7 were addressed in slice 2.5, 11 were addressed in subsequent slice prompts (3-8), and 7 were deferred to v1.5+.
+
+**Bugs distributed to slices 3-8:**
+
+- Bug 2 (Returning-after-break resume logic) → Slice 3
+- Bug 4 (Real-time pattern detection within session) → Slice 8
+- Bug 6 (Onboarding pause option) → Slice 6
+- Bug 13 (Session-state cleared on boundary) → Slice 3 (strengthened in slice 3 verification fixes)
+- Bug 14 (Profile cache invalidation hardening) → Slice 5
+- Bug 15 (Mixed-intent secondary signal) → Slice 4
+- Bug 22 (Granular subskill enum from planner) → Slice 4
+- Bug 23 (Profile-derived default difficulty) → Slice 5
+- Bug 24 (Post-onboarding session boundary) → Slice 6
+- Bug 25 (Empty-state fallback in profile brief) → Slice 5
+- Bug 9 (Long-message chunking) → Slice 2.5 implementation note
+
+**Bugs deferred to v1.5+:**
+
+- Bug 3 (deeper) — Topic switch with paused contexts preserved
+- Bug 5 — Loading message timeout fallback
+- Bug 7 — Flow mode for power users
+- Bug 10 — /feedback command
+- Bug 16 — Free text input during onboarding states
+- Bug 17 — Voice/image messages
+- Bug 21 — Long-context within-session summarization
+
+**Why these specific deferrals:** The deferred bugs are nice-to-haves, scaling concerns, or features that don't break the core experience. The slice-distributed bugs are blocking for their respective slices but not blocking right now. The slice-2.5 bugs are blocking right now (UX-breaking or reliability foundations).
+
+**Revisit when:** v1 ships and we have real-user data. Real-user feedback will likely re-prioritize.
+
+---
+
+### 2026-04-25 — Skip is "seen" but not "answered"
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5
+
+**Decision:** When a student taps [Skip / I don't know] on a question:
+- The attempt row gets `skipped = true`, `answered_at = now`, `is_correct = null`, `student_answer = null`, `explanation_shown = true`.
+- The student SEES the explanation (the same explanation they'd see for a wrong answer, minus the "you picked X" line).
+- The retrieval ladder considers this question "seen" — it won't be re-served via tier 1-4 (unseen tiers); only via tier 5 (stale-seen) or tier 6 (oldest-seen).
+- The skip does NOT count as a wrong answer for accuracy stats. It's its own category.
+
+**Why:** Skip respects the student's autonomy ("I don't want to guess; just teach me") while still giving them the educational value of the explanation. Treating skips as wrong answers would penalize honesty; treating them as "didn't see" would re-serve the same question, which feels punitive.
+
+**Rejected alternatives:**
+- **Skip = wrong answer:** rejected; penalizes honest "I don't know" responses, encouraging guessing.
+- **Skip = unseen (re-serve later):** rejected; punitive after the student already saw the explanation.
+- **Skip = no explanation shown:** rejected; misses the teaching opportunity.
+
+**Tradeoffs accepted:**
+- Stats need to track skip count separately. Acceptable — `get_session_stats` reports it explicitly.
+- Some students might over-use Skip. Observable via session stats; intervention can land in slice 8 if pattern emerges.
+
+**Revisit when:** Real-user data shows skip-rate > 30% or pattern of avoidance.
+
+---
+
+### 2026-04-25 — Continuation button sets are deterministic, not LLM-generated
+
+**Status:** Decided
+**Slice / Phase:** Slice 2.5
+
+**Decision:** The buttons that appear after agent responses (continuation prompts, mentor strategic responses, mid-question doubt acks) are selected by orchestrator code, not by the LLM. Different button sets fire based on `response_type`, `intent.action`, and `intent.emotional_tone`.
+
+Examples:
+- After answer/skip explanation → `[Next question]` `[Different subskill]` `[Show my stats]` `[I have a doubt]` `[I'm done]`
+- Mid-question doubt ack → `[Back to the question]` `[Skip this question]` `[I have a different question]`
+- Returning-after-break prompt → `[Resume that question]` `[Start fresh]` `[Just chat first]`
+- After mentor anxiety/frustration response → `[Try one easy one]` `[Different subskill]` `[Talk it out more]` `[Take a break]`
+
+**Why:** LLM-generated buttons would be inconsistent, unpredictable, and hard to validate. Deterministic selection ensures every flow has the right options every time. The agents' LLM is told NOT to include questions, options, or buttons in their output — the system appends them.
+
+**Rejected alternatives:**
+- **LLM picks the buttons:** rejected for consistency reasons above.
+- **Single universal continuation button set:** rejected because context matters.
+- **No buttons; pure free text:** rejected because button taps are faster on mobile and reduce friction.
+
+**Tradeoffs accepted:**
+- Button-set logic is in orchestrator code (~50 lines). Maintainable.
+- Adding new continuation contexts requires adding new button sets in code. Acceptable; rare.
+
+**Revisit when:** Real-user data shows consistent dead-ends (a context where no offered button matches what users want). Add the missing option.
+
+---
+
+## Slice 3 entries
+
+These cover the slice 3 implementation (working memory + sessions, returning-after-break, LLM-generated explanations) and the verification fixes that surfaced during testing.
+
+---
+
+### 2026-04-26 — Slice 3 verified: 30-minute session boundary
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3
+
+**Decision:** A session boundary fires when a new message arrives more than 30 minutes after the previous message in the same session. The closed session is marked `ended_at = now()`, `end_reason = 'inactivity_timeout'`. A new session row is created and `state:tg:{tg_id}` is DELed in Redis before the new state is set (Principle 3 enforcement).
+
+Earlier internal drafts considered 2-hour and 1-hour windows. 30 minutes was chosen because:
+- CAT prep sessions are short and intense (typically 20-45 min)
+- 30 min is short enough that "I came back the next morning" reliably triggers the returning-after-break flow
+- Long enough that bathroom breaks / phone interruptions don't constantly fragment sessions
+
+**Why:** Session boundaries are how the bot scopes "what we worked on today" vs "what we did last time." Wrong threshold either fragments coherent sessions (too short) or merges distinct study sessions (too long). 30 minutes is empirically a good fit for CAT prep behavior.
+
+**Rejected alternatives:**
+- **Explicit user-initiated session end only:** rejected because users rarely explicitly end sessions.
+- **Fixed clock boundaries (e.g., midnight):** rejected because students study across midnight.
+- **Adaptive (per-student learned threshold):** rejected as v1.5+ optimization.
+
+**Tradeoffs accepted:**
+- A user who steps away for 31 minutes mid-session will have their session split. Acceptable; the resume prompt softens this.
+- Cleanup cron runs every 10 min, so sessions actually close 30-40 min after last activity. Acceptable timing.
+
+**Revisit when:** Real-user data shows fragmenting (lots of short sessions) or merging (sessions spanning days).
+
+---
+
+### 2026-04-26 — Slice 3 verified: queries are session-scoped, not student-scoped
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3
+
+**Decision:** All queries that read "current state" — open unanswered attempts, session stats, recent turns for prompt context — are filtered by `session_id` AND `student_id`, not just `student_id`.
+
+This means: the orchestrator's `_fetch_last_unanswered_attempt(student_id, session_id)` returns nothing if the unanswered attempt is in a closed (different) session. The student starting a new session has no "open question" from the old session bleeding into the new one.
+
+Returning-after-break is the explicit exception: `detect_session_resume_candidate(student_id)` looks across sessions to find unfinished work in the most recently closed session. But it surfaces this as a deliberate prompt ("want to resume?"), not as silent state.
+
+**Why:** Bug 13 (session-state leak) was a category of bugs — domain_state, last_question_attempt_id, recent_turns — all liable to cross session boundaries by accident. Enforcing session-scoping at the query level is the structural fix. State physically cannot leak if the query won't return it.
+
+**Rejected alternatives:**
+- **Clear all per-student state at boundary:** rejected because some state (working memory cache, profile brief cache) intentionally persists across sessions.
+- **Document the rule in code comments only:** rejected because future code changes would re-introduce the bug. Query-level enforcement is structural.
+
+**Tradeoffs accepted:**
+- Slice 2/2.5 attempts (with `session_id IS NULL`) are invisible to session-scoped stats queries. Acceptable; they're test data.
+
+**Revisit when:** A new query needs cross-session reads. The pattern is: explicit cross-session functions (like `detect_session_resume_candidate`) are clearly named; default scoping is per-session.
+
+---
+
+### 2026-04-26 — Slice 3 verified: old-session keyboard close deferred to new question serve
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3
+
+**Decision:** When a session boundary fires (cleanup or new-message-after-30-min), the OLD session's last question's inline keyboard is NOT removed at boundary time. It's removed when the NEW session's first question is served (orchestrator's Step 11.5 picks up `prior_question_message_id` from `resolve_session`'s third return value).
+
+Trade-off: between the boundary and the next question serve, the OLD question's keyboard remains tappable in chat history. If the user taps it during this window, the answer routes to the new session and finds no matching open attempt → falls through to a default action.
+
+**Why:** Closing keyboards requires a Telegram API call (`editMessageReplyMarkup`). We don't want to add latency or complexity to the cleanup cron path. Doing it lazily costs nothing and is sufficient for the common case.
+
+**Rejected alternatives:**
+- **Close keyboard at boundary:** would require cleanup cron to call Telegram API. Rejected.
+- **Close keyboard when resume prompt is shown:** premature; user hasn't decided yet.
+
+**Tradeoffs accepted:**
+- Stale button tap during the resume-prompt window is theoretically possible, practically rare.
+
+**Revisit when:** Users complain about stale-button confusion in real testing. Likely never; this edge case is too narrow.
+
+---
+
+### 2026-04-26 — Slice 3 verified: LLM call logging is best-effort
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3
+
+**Decision:** `record_llm_call` (writes to `v5.llm_calls`) catches all exceptions internally. A logging failure NEVER sinks the user-facing response.
+
+**Why:** Per Principle 5, UX never breaks on infrastructure failure. An observability table going down is exactly the kind of dependency that should fail silently for the user.
+
+**Rejected alternatives:**
+- **Make logging blocking:** rejected. Observability is a tool for us, not a contract with the user.
+- **Async logging via queue:** overkill for v1.
+
+**Tradeoffs accepted:**
+- We may have gaps in `v5.llm_calls` if Postgres has transient issues. Acceptable for cost analytics.
+
+**Revisit when:** We need accurate per-user cost attribution for billing or analytics SLAs.
+
+---
+
+### 2026-04-26 — Slice 3 verified: shared LLM and observability infrastructure
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3
+
+**Decision:** Three shared modules introduced in slice 3 are now the canonical interface for any service making LLM calls or needing keyboard close coordination:
+
+1. **`shared.llm.openrouter.chat_with_metadata(system, user, model) → LLMCallResult`** — replaces older content-only wrappers (still around for `v4_legacy`). Returns content + token counts + cost + latency. Has retry-once-on-failure built in.
+
+2. **`shared.observability.llm_log.record_llm_call(...)`** — best-effort logger. Required after every `chat_with_metadata` call.
+
+3. **`shared.telegram.utils.edit_telegram_keyboard(...)`** — keyboard close helper. Used by bus when `response.requires_keyboard_close=True`. Catches all errors; never raises.
+
+**Why:** These cross-cut every service. Without shared modules, each service would re-implement (or worse, miss) cost tracking, retry logic, and keyboard-close handling. Making them shared and required means future slices add features cleanly.
+
+**Rejected alternatives:**
+- **Per-service implementations:** rejected for duplication and inconsistency.
+- **Wrapper class hierarchy:** rejected as over-engineered for v1.
+
+**Tradeoffs accepted:**
+- Backward-compat wrappers still exist for v4_legacy. Some duplication; acceptable until v4 is fully retired.
+- The "every LLM call must log" rule is enforced by convention, not code. Caught by reviewing slice prompts.
+
+**Revisit when:** v4_legacy is fully retired; remove the older wrappers.
+
+---
+
+### 2026-04-26 — Slice 3 verification: markdown rendering switched to HTML parse mode
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3 verification (mid-cycle fix)
+
+**Decision:** All orchestrator-composed responses now use Telegram's HTML parse mode instead of legacy Markdown. LLM-generated content goes through `html.escape()` before delivery. Bus-side fallback retries without parse_mode if Telegram returns a parse error.
+
+**Why:** The original implementation used legacy Markdown. Subskill names contain underscores (`inference_basic`); the legacy Markdown parser interprets unmatched `_` as italic markers and rejects the message. The bus's fallback delivered plain text — users saw raw asterisks instead of bold headers.
+
+HTML parse mode requires escaping only `<`, `>`, `&` — not present in normal English or subskill names.
+
+**Rejected alternatives:**
+- **MarkdownV2:** rejected; requires escaping ~14 special characters that appear in normal sentences.
+- **Escape underscores in legacy Markdown:** rejected; brittle, every subskill render needs its own escape.
+- **No parse mode at all:** rejected; we lose visual hierarchy in stats and templated responses.
+
+**Tradeoffs accepted:**
+- LLM-generated content cannot use formatting for emphasis. Word choice carries the weight.
+- HTML escape pass adds ~1ms per turn. Negligible.
+- Adding new orchestrator templates requires HTML tags, not markdown.
+
+**Revisit when:** A real-user complaint shows raw HTML tags rendering literally.
+
+---
+
+### 2026-04-26 — Slice 3 verification: message_count + Redis cleanup fixes
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3 (verification phase)
+
+**Decision:** Two bugs surfaced during Phase B testing of slice 3:
+
+1. **`v5.sessions.message_count` was not being incremented on each turn.** The orchestrator updated `last_activity_at` correctly but the same UPDATE did not bump `message_count`. Fixed by combining the two into a single UPDATE that runs on every continuation turn. Convention: counts turns (one user + one assistant = +1).
+
+2. **`cleanup_inactive_sessions` closed sessions in Postgres without clearing Redis state.** Fixed by having `close_session` (called by cleanup) do Postgres update + Redis DEL as a single semantic operation. Every caller of `close_session` now inherits the cleanup automatically. Also added a defensive staleness check in `resolve_session` for layered protection.
+
+The pattern: Postgres is the source of truth; Redis is a derived cache; writes to Postgres MUST propagate to Redis.
+
+This is now an invariant in service contracts: **any code path closing a Postgres session MUST clear the corresponding Redis state for that student's tg_id, in the same operation.**
+
+**Why:** Both bugs were latent — neither caused user-facing UX issues during normal flow. But `message_count = 0` for active sessions breaks analytics queries, and stale Redis state would have caused subtle behavior 2-3 weeks in.
+
+**Rejected alternatives:**
+- **Defensive staleness check ONLY in `resolve_session`:** insufficient — wouldn't handle a future code path that closes a session without going through resolve_session on next turn.
+- **Move `message_count` to Redis:** rejected because the column needs to persist in closed-session analytics anyway.
+
+**Tradeoffs accepted:**
+- `cleanup_inactive_sessions` now does an extra JOIN to fetch `tg_id`. Negligible cost.
+- `message_count` counts turns, not individual messages. If we later want user-only counts, that's a different column.
+- `resolve_session` does an extra Postgres PK lookup on every turn (the staleness check). ~10ms latency. Acceptable.
+
+**Revisit when:** A new code path closes sessions outside of `cleanup_inactive_sessions` — the path inherits Redis cleanup automatically through `close_session`.
+
+---
+
+### 2026-04-26 — Schema drift caught by audit: fallback_tier added mid-cycle (migration 015)
+
+**Status:** Decided  
+**Slice / Phase:** Slice 3 verification (mid-cycle fix)
+
+**Decision:** During slice 3 verification, a schema audit revealed that `v5.student_question_attempts.fallback_tier` was specified in the data model but never created by slice 2's migration. The retrieval ladder was already computing the tier and surfacing it in `messages.metadata`, but not landing it on the attempts row.
+
+Fixed via `migrations/v5/015_add_fallback_tier_to_attempts.sql` — adds the column, threads `fallback_tier` through `_record_attempt` and its two call sites in VARC. Existing rows stay NULL (no backfill).
+
+This incident motivated the **Schema Drift Discipline** documented in `04_slice_roadmap.md`:
+1. Each slice's roadmap section enumerates migrations + columns explicitly
+2. CREATE TABLE migrations include ALL columns from the data model — even future-slice columns
+3. `python -m scripts.check_schema_drift` runs after every slice's migrations apply
+4. Migration numbering is sequential and never reused
+5. Mid-cycle migrations get the next available number
+
+The drift check helper (`scripts/check_schema_drift.py`) was added in this fix's commit.
+
+**Why:** Schema drift is the most common silent bug source. Slice 2's prompt said "create the schema" without saying "create THIS schema with THESE columns." Claude Code, working from a slice prompt, had no way to know the data model had columns the prompt didn't explicitly call out.
+
+The fix: be explicit. Every slice prompt now enumerates migrations file-by-file with column lists. Every slice ends with a drift-check verification step.
+
+**Rejected alternatives:**
+- **Wholesale "redo all migrations":** rejected — invites destructive ALTERs and disruption to migration tracker.
+- **Fix only the immediate gap and accept future drift:** rejected — drift accumulates.
+- **Switch to a migration auto-generator:** considered but rejected for v1; manual migrations are fine at this scale.
+
+**Tradeoffs accepted:**
+- Three other columns (onboarding_paused_at, diagnostic_question_count, is_diagnostic) remain unaddressed at end of slice 3. They're scheduled to land with migration 016 in slice 6. The drift check correctly reports these as drift; exit code 1 is expected at end-of-slice-3.
+- Each slice now spends a few minutes on drift verification. Cheap; catches recurrence.
+
+**Revisit when:** Slice 6 ships migration 016. Drift check should output ALL `[OK]` after slice 6.
+
+---
+
+## Process Notes
+
+These document how the docs themselves are maintained, so future slices stay aligned.
+
+---
+
+### 2026-04-26 — Documentation versioning: design docs update with slices
+
+**Status:** Decided  
+**Slice / Phase:** End of slice 3
+
+**Decision:** The five design docs (`01_data_model.md`, `02_service_contracts.md`, `03_happy_path.md`, `04_slice_roadmap.md`, `05_claude_code_prompts.md`) plus `DECISIONS.md` are updated in lockstep with slice implementations.
+
+When a slice introduces architectural changes:
+1. The slice prompt is updated FIRST (in `05_claude_code_prompts.md`) so Claude Code has the right brief
+2. After slice ships, the data model and service contracts are updated to match what was actually built
+3. The slice roadmap's migrations subsection and "what's real" / "what's stubbed" sections are updated
+4. DECISIONS.md gets entries for any architectural decisions made during the slice
+5. The happy path doc is updated when major flow changes happen (less frequent than the others)
+
+When a slice has verification fixes (mid-cycle bug fixes that fix the slice's deliverables):
+- The fix is NOT in a separate slice — it's part of the slice's delivery
+- DECISIONS.md gets a "Slice N verification: ..." entry for the fix
+- Service contracts and/or data model are updated if the fix changes the contract or schema
+- Slice roadmap's "What was actually shipped" section gets the fix added
+
+**Why:** Without this discipline, docs drift from reality. Slice 6 looking at `01_data_model.md` from slice 3's era would have stale schema info. The cost of maintaining docs is small if done immediately; large if deferred.
+
+**Rejected alternatives:**
+- **Update all docs at v1 ship:** rejected — too much accumulated drift; impossible to remember 8 slices' worth of decisions.
+- **Auto-generate docs from code:** rejected — design docs capture intent and tradeoffs that code can't.
+- **No design docs after slice 1:** rejected — without docs, every Claude Code session starts from scratch on context.
+
+**Tradeoffs accepted:**
+- Each slice adds ~30-60 minutes of doc maintenance. Acceptable given how much time it saves on the next slice.
+- Docs lag code by hours-to-a-day during active development. Acceptable; pre-merge alignment is the bar, not real-time consistency.
+
+**Revisit when:** Doc maintenance becomes burdensome (e.g., every slice taking >2 hours of doc work). At that point, consider tooling.
+
+---
 <!-- 
 TEMPLATE FOR NEW ENTRIES — copy and fill:
 
