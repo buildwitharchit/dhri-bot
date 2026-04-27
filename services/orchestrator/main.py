@@ -166,7 +166,10 @@ async def handle_message(
                 else fresh_state.get("last_question_message_id")
             )
 
-        # Step 12: persist assistant message (Fix 6 — fail loud)
+        # Step 12: persist assistant message (Fix 6 — fail loud).
+        # keyboard_json: stash the structured inline keyboard so a Telegram
+        # retry (Step 0) can reconstruct it on re-delivery instead of just
+        # re-sending the text. Slice-4 verification fix.
         try:
             await _persist_message(
                 student_id=student_id,
@@ -176,6 +179,7 @@ async def handle_message(
                 content_type=response.get("content_type", "text"),
                 metadata={
                     "intent_classification": intent,
+                    "keyboard_json": response.get("keyboard"),
                     **(response.get("meta") or {}),
                 },
             )
@@ -221,7 +225,7 @@ async def _check_telegram_retry(tg_update_id: int) -> Optional[dict]:
     logger.info("idempotency: telegram retry detected for update_id=%s", tg_update_id)
     paired = await db.fetchrow(
         """
-        SELECT content, content_type
+        SELECT content, content_type, metadata
         FROM v5.messages
         WHERE student_id = $1 AND role = 'assistant' AND created_at > $2
         ORDER BY created_at ASC LIMIT 1
@@ -229,10 +233,21 @@ async def _check_telegram_retry(tg_update_id: int) -> Optional[dict]:
         duplicate["student_id"], duplicate["created_at"],
     )
     if paired is not None:
+        # Reconstruct the inline keyboard from metadata.keyboard_json so the
+        # retry redelivers the same A/B/C/D + Skip (or whatever was on the
+        # original turn). Slice-4 verification fix; pre-fix retries dropped
+        # the keyboard and re-sent text only.
+        meta_raw: Any = paired["metadata"] or {}
+        if isinstance(meta_raw, str):
+            try:
+                meta_raw = json.loads(meta_raw)
+            except (TypeError, ValueError):
+                meta_raw = {}
+        keyboard = meta_raw.get("keyboard_json") if isinstance(meta_raw, dict) else None
         return {
             "content": paired["content"],
             "content_type": paired["content_type"],
-            "keyboard": None,
+            "keyboard": keyboard,
             "requires_keyboard_close": False,
             "memory_deltas": {},
             "observer_events": [],
@@ -297,7 +312,16 @@ async def _classify_action_deterministic(
             if sub == "doubt":
                 return _intent("varc", "continue_doubt"), {}
             if sub == "subskill":
-                return _intent("varc", "subskill_switch"), {}
+                # Bare [Different subskill] tap → orchestrator-direct picker.
+                return _intent("orchestrator", "subskill_picker"), {}
+            if sub.startswith("subskill_"):
+                # Picker selection: v5_continue_subskill_<subskill_name>.
+                # Routes as practice_request with intent.subskill set so VARC's
+                # _handle_practice_request retrieval criteria pick it up.
+                chosen = sub[len("subskill_"):]
+                intent = _intent("varc", "practice_request")
+                intent["subskill"] = chosen
+                return intent, {}
             if sub == "done":
                 return _intent("orchestrator", "session_end"), {}
 
@@ -327,15 +351,75 @@ async def _classify_action_deterministic(
                     "detected_answer": detected, "attempt_row": last_unanswered,
                 }
             }
-        if last_unanswered is not None and detected is None:
-            # Mid-question doubt: deterministic override per spec, even with
-            # planner active. Stops planner from misclassifying the doubt as
-            # a fresh practice_request.
+        if (
+            last_unanswered is not None
+            and detected is None
+            and _looks_like_doubt(content)
+        ):
+            # Mid-question doubt: deterministic override only when the message
+            # actually LOOKS like a doubt (slice-4 verification fix). Pre-fix
+            # this branch fired on ANY free text during an open question, which
+            # broke Bug 15 by swallowing small_talk acks ("thanks", "ok").
             return _intent("varc", "doubt_about_current"), {
                 "current_unanswered_attempt": last_unanswered,
             }
+        # Otherwise fall through — planner classifies (small_talk /
+        # practice_request / etc). When planner returns practice_request and
+        # an open question exists, _route_intent → varc → _question_serve_response
+        # (requires_keyboard_close=True) closes the abandoned question's
+        # keyboard via Step 11.5, consistent with [Different subskill] flow
+        # (Principle 2).
 
     return None
+
+
+# Heuristic vocabulary used by _looks_like_doubt below. Kept liberal (any of
+# these tokens, regardless of position) so doubts like "what's a premise" or
+# "I don't get this" both register.
+_DOUBT_QUESTION_WORDS = {
+    "what", "why", "how", "when", "where", "which", "who",
+    "explain", "mean", "means", "meaning",
+    "doesn't", "don't", "dont",
+    "confused", "unclear", "stuck", "lost",
+}
+
+
+def _looks_like_doubt(message: str) -> bool:
+    """Heuristic for distinguishing mid-question doubts from small_talk
+    when an unanswered question is active.
+
+    A doubt typically:
+    - Contains "?" or a question word like "what" / "why" / "explain"
+    - OR signals confusion ("confused", "stuck")
+
+    Small_talk like "ok", "thanks", "got it", "cool" has neither. Letting
+    those through to the planner gives the LLM a chance to classify them
+    correctly (small_talk).
+
+    Returns True only when there's a clear question signal. Borderline cases
+    (longer messages without a question marker) fall through to the planner —
+    the LLM is better at nuanced classification than a regex.
+    """
+    msg = (message or "").lower().strip()
+    if not msg:
+        return False
+
+    word_count = len(msg.split())
+    has_question_mark = "?" in msg
+    tokens = {w.strip(".,!?;:") for w in msg.split()}
+    has_question_word = bool(tokens & _DOUBT_QUESTION_WORDS)
+
+    # Very short messages (<=2 words) without any question signal are
+    # almost certainly small_talk acks, not doubts.
+    if word_count <= 2 and not has_question_mark and not has_question_word:
+        return False
+
+    # Longer messages: trust if it has a question signal OR confusion marker.
+    if has_question_mark or has_question_word:
+        return True
+
+    # Longer messages without a question signal — let the planner decide.
+    return False
 
 
 def _intent(domain: str, action: str) -> dict:
@@ -479,6 +563,8 @@ async def _handle_orchestrator_action(
         return _build_resume_chat_response()
     if action == "strategy_chat":
         return _build_strategy_chat_response()
+    if action == "subskill_picker":
+        return await _build_subskill_picker_response(student_id)
     return _canned("Something's not quite right — let's start fresh.")
 
 
@@ -654,6 +740,106 @@ async def _build_retry_response(student_id: str, tg_id: int, session_id: str) ->
     }
     base_context["intent"] = stashed if isinstance(stashed, dict) else _intent("varc", "practice_request")
     return await varc_handle(base_context)
+
+
+# Subskill picker (slice 4 verification fix) ─────────────────────────────────
+#
+# `inference_advanced` is reserved for a future content drop — if the picker
+# offers it and no questions exist for that subskill yet, VARC's 6-tier
+# retrieval falls through to tier 4 (any subskill) and serves *something*.
+# Acceptable graceful degradation; populating that subskill is content work,
+# not slice-4 work.
+_DEFAULT_PICKER_SUBSKILLS = [
+    "inference_basic",
+    "main_idea_full_passage",
+    "specific_detail",
+    "inference_advanced",
+]
+
+_SUBSKILL_DISPLAY_NAMES = {
+    "inference_basic": "Inference (basic)",
+    "inference_advanced": "Inference (advanced)",
+    "strengthen_weaken": "Strengthen / weaken",
+    "main_idea_full_passage": "Main idea",
+    "passage_summary": "Passage summary",
+    "specific_detail": "Specific detail",
+    "vocab_in_context": "Vocab in context",
+    "author_tone": "Author tone",
+    "purpose_of_example": "Purpose of example",
+    "logical_structure": "Logical structure",
+}
+
+
+def _subskill_display_name(name: str) -> str:
+    return _SUBSKILL_DISPLAY_NAMES.get(name, name.replace("_", " ").title())
+
+
+async def _compute_subskill_picker_options(student_id: str) -> list[str]:
+    """Return up to 4 subskill names for the picker, computed from the
+    student's recent answered attempts.
+
+    Algorithm:
+    - Top 3 weakest subskills with >=5 answered attempts (sorted by accuracy ascending)
+    - Plus inference_basic if not already present (so every picker has a
+      strong default the student is comfortable with)
+    - If the student has <5 answered attempts on every subskill: return
+      _DEFAULT_PICKER_SUBSKILLS as the cold-start picker."""
+    rows = await db.fetch(
+        """
+        SELECT q.subskill,
+               count(*) AS attempted,
+               count(*) FILTER (WHERE a.is_correct = true) AS correct,
+               round(
+                 count(*) FILTER (WHERE a.is_correct = true)::numeric
+                 / NULLIF(count(*) FILTER (WHERE a.answered_at IS NOT NULL), 0),
+                 2
+               ) AS accuracy
+        FROM v5.student_question_attempts a
+        JOIN public.questions q ON q.question_id = a.question_id
+        WHERE a.student_id = $1::uuid
+          AND a.answered_at IS NOT NULL
+        GROUP BY q.subskill
+        HAVING count(*) >= 5
+        ORDER BY accuracy ASC
+        LIMIT 3
+        """,
+        student_id,
+    )
+    weakest = [r["subskill"] for r in rows]
+    if not weakest:
+        return list(_DEFAULT_PICKER_SUBSKILLS)
+    if "inference_basic" not in weakest:
+        weakest.append("inference_basic")
+    return weakest[:4]
+
+
+async def _build_subskill_picker_response(student_id: str) -> dict:
+    """Slice-4 verification fix: real subskill picker, replacing VARC's
+    placeholder. Selecting a button routes as practice_request with
+    intent.subskill set explicitly (handled in _classify_action_deterministic
+    via the v5_continue_subskill_<name> callback prefix)."""
+    options = await _compute_subskill_picker_options(student_id)
+    buttons = [
+        {
+            "text": _subskill_display_name(name),
+            "callback_data": f"v5_continue_subskill_{name}",
+        }
+        for name in options
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return {
+        "content": "Pick a subskill to practice:",
+        "content_type": "text_with_keyboard",
+        "keyboard": {"inline_keyboard": rows},
+        "requires_keyboard_close": False,
+        "memory_deltas": {},
+        "observer_events": [],
+        "meta": {
+            "agent": "orchestrator",
+            "response_type": "subskill_picker",
+            "options": options,
+        },
+    }
 
 
 def _continuation_keyboard_for_stats() -> dict:

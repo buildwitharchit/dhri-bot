@@ -85,11 +85,10 @@ async def handle(context: dict) -> dict:
         return _handle_continue_doubt(context)
     if action == "resume_question":
         return await _handle_resume_question(context)
-    if action == "subskill_switch":
-        return await _handle_practice_request(
-            context,
-            prefix="Sticking with inference for now — the subskill picker lands in slice 4.",
-        )
+    # subskill_switch removed in slice 4 verification: the [Different subskill]
+    # button is now an orchestrator-direct picker, and picker selections route
+    # as practice_request with intent.subskill set. If a stale subskill_switch
+    # action somehow reaches here, fall through to a normal practice_request.
     return await _handle_practice_request(context)
 
 
