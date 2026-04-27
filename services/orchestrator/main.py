@@ -775,20 +775,26 @@ def _subskill_display_name(name: str) -> str:
 
 
 async def _compute_subskill_picker_options(student_id: str) -> list[str]:
-    """Return up to 4 subskill names for the picker, computed from the
-    student's recent answered attempts.
+    """Return EXACTLY 4 subskill names for the picker, computed from the
+    student's recent answered attempts and padded with defaults.
 
     Algorithm:
     - Top 3 weakest subskills with >=5 answered attempts (sorted by accuracy ascending)
-    - Plus inference_basic if not already present (so every picker has a
-      strong default the student is comfortable with)
-    - If the student has <5 answered attempts on every subskill: return
-      _DEFAULT_PICKER_SUBSKILLS as the cold-start picker."""
+    - Pad with _DEFAULT_PICKER_SUBSKILLS to reach 4, skipping duplicates.
+    - The inference_basic special case (always-included default) is now
+      implicit: inference_basic is the first entry in _DEFAULT_PICKER_SUBSKILLS,
+      so if it's not already in weakest it'll be the first padded entry.
+    - Cold start (no subskill has enough attempts): returns the 4 defaults.
+
+    Slice-4 verification fix: previously returned weakest[:4] which could
+    surface a 1-button picker when the student had 5+ answered attempts on
+    only one subskill.
+    """
     rows = await db.fetch(
         """
         SELECT q.subskill,
-               count(*) AS attempted,
                count(*) FILTER (WHERE a.is_correct = true) AS correct,
+               count(*) FILTER (WHERE a.answered_at IS NOT NULL) AS answered,
                round(
                  count(*) FILTER (WHERE a.is_correct = true)::numeric
                  / NULLIF(count(*) FILTER (WHERE a.answered_at IS NOT NULL), 0),
@@ -806,11 +812,20 @@ async def _compute_subskill_picker_options(student_id: str) -> list[str]:
         student_id,
     )
     weakest = [r["subskill"] for r in rows]
+
+    # Cold start: no subskill has enough attempts → return all 4 defaults.
     if not weakest:
         return list(_DEFAULT_PICKER_SUBSKILLS)
-    if "inference_basic" not in weakest:
-        weakest.append("inference_basic")
-    return weakest[:4]
+
+    # Pad with defaults to reach 4, skipping any already in weakest.
+    result = list(weakest)
+    for default in _DEFAULT_PICKER_SUBSKILLS:
+        if len(result) >= 4:
+            break
+        if default not in result:
+            result.append(default)
+
+    return result[:4]
 
 
 async def _build_subskill_picker_response(student_id: str) -> dict:
