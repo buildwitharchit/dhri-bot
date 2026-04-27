@@ -254,6 +254,45 @@ async def process_session_end(session_id: str) -> None:  # noqa: ARG001
     return
 
 
+# ─── observer_events inline persistence ─────────────────────────────────────
+
+
+async def persist_observer_event(
+    student_id: Optional[str],
+    session_id: Optional[str],
+    event_type: str,
+    payload: Optional[dict] = None,
+) -> None:
+    """Best-effort INSERT into v5.observer_events. Never blocks delivery
+    (Principle 5).
+
+    Slice 1 originally specified that observer_events would be persisted via
+    commit_deltas in the memory service, but commit_deltas was never built.
+    This helper is the inline replacement — every site emitting an
+    observer_event calls this directly. Future cleanup: centralize into a
+    real commit_deltas pass when the AgentResponse pipeline gets refactored.
+    """
+    try:
+        await db.execute(
+            """
+            INSERT INTO v5.observer_events
+              (student_id, session_id, event_type, payload)
+            VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)
+            """,
+            student_id,
+            session_id,
+            event_type,
+            json.dumps(payload or {}),
+        )
+    except Exception as e:
+        logger.warning(
+            "persist_observer_event failed (best-effort): "
+            "event_type=%s student_id=%s err=%s",
+            event_type, student_id, e,
+        )
+        # Do not raise — Principle 5.
+
+
 # ─── returning-after-break detection (Bug 2) ───────────────────────────────
 
 

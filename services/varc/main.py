@@ -32,6 +32,7 @@ import logging
 from typing import Any, Optional
 
 from config import settings
+from services.memory.main import persist_observer_event
 from shared.db.client import db
 from shared.llm.openrouter import LLMCallResult, chat_with_metadata
 from shared.observability.llm_log import record_llm_call
@@ -204,7 +205,7 @@ async def _handle_answer(context: dict) -> dict:
         )
     except Exception:
         logger.exception("varc: explanation LLM failed; serving error fallback")
-        return _error_fallback_response(context["intent"])
+        return await _error_fallback_response(context)
 
     return {
         "content": explanation,
@@ -272,7 +273,7 @@ async def _handle_skip(context: dict) -> dict:
         )
     except Exception:
         logger.exception("varc: skip-explanation LLM failed; serving error fallback")
-        return _error_fallback_response(context["intent"])
+        return await _error_fallback_response(context)
 
     return {
         "content": explanation,
@@ -467,7 +468,22 @@ async def _handle_resume_question(context: dict) -> dict:
 # ─── error fallback (slice 2.5 carry-over) ─────────────────────────────────
 
 
-def _error_fallback_response(original_intent: dict) -> dict:
+async def _error_fallback_response(context: dict) -> dict:
+    """Inline-persists the llm_failure observer event before returning the
+    user-facing fallback. Was synchronous in slice 2.5 — now async so the
+    persist call is awaited (best-effort, never blocks; see
+    persist_observer_event)."""
+    original_intent = context.get("intent") or {}
+    payload = {
+        "agent": "varc",
+        "action": original_intent.get("action"),
+    }
+    await persist_observer_event(
+        student_id=context.get("student_id"),
+        session_id=context.get("session_id"),
+        event_type="llm_failure",
+        payload=payload,
+    )
     return {
         "content": LLM_FALLBACK_TEXT,
         "content_type": "text_with_keyboard",
@@ -478,7 +494,7 @@ def _error_fallback_response(original_intent: dict) -> dict:
         "memory_deltas": {},
         "observer_events": [{
             "event_type": "llm_failure",
-            "payload": {"agent": "varc"},
+            "payload": payload,
         }],
         "meta": {
             "agent": "varc",

@@ -34,6 +34,7 @@ from shared.redis.client import acquire_lock, get_state, release_lock
 from services.memory.main import (
     append_turn,
     get_recent_turns,
+    persist_observer_event,
     resolve_session,
 )
 from services.orchestrator import planner as planner_module
@@ -416,7 +417,12 @@ async def _route_intent(
 
     # Out-of-scope guardrail — soft-redirect, no agent, no LLM (Step 7).
     if domain == "out_of_scope" or action == "off_topic":
-        return _build_out_of_scope_response()
+        return await _build_out_of_scope_response(
+            student_id=student_id,
+            session_id=session_id,
+            intent=intent,
+            user_message=content,
+        )
 
     # Orchestrator-direct actions.
     if domain == "orchestrator":
@@ -558,9 +564,31 @@ def _build_small_talk_response() -> dict:
     }
 
 
-def _build_out_of_scope_response() -> dict:
+async def _build_out_of_scope_response(
+    *,
+    student_id: str,
+    session_id: str,
+    intent: dict,
+    user_message: str,
+) -> dict:
     """Slice 4: soft-redirect for quant/LRDI/general off-topic. No agent
-    invocation, no LLM call — pure templated response with two buttons."""
+    invocation, no LLM call — pure templated response with two buttons.
+
+    Inline-persists the out_of_scope_query observer event (the AgentResponse
+    delta pipeline isn't wired yet — see persist_observer_event for the
+    history). Payload includes the user's message + classification so future
+    analytics can spot misclassification patterns."""
+    payload = {
+        "original_message": (user_message or "")[:500],
+        "domain_classified": intent.get("domain"),
+        "action_classified": intent.get("action"),
+    }
+    await persist_observer_event(
+        student_id=student_id,
+        session_id=session_id,
+        event_type="out_of_scope_query",
+        payload=payload,
+    )
     return {
         "content": (
             "I'm focused on CAT VARC for now, so I can't help with that. "
@@ -571,7 +599,7 @@ def _build_out_of_scope_response() -> dict:
         "requires_keyboard_close": False,
         "memory_deltas": {},
         "observer_events": [
-            {"event_type": "out_of_scope_query", "payload": {}},
+            {"event_type": "out_of_scope_query", "payload": payload},
         ],
         "meta": {"agent": "orchestrator", "response_type": "off_topic_redirect"},
     }
