@@ -38,8 +38,8 @@ This discipline catches drift in seconds (script call) instead of hours (product
 | 2 | Real retrieval | 2-3h | VARC retrieves real questions, scoring works | ✅ shipped |
 | **2.5** | **Retrofit fixes** | **3-5h** | **Skip button, mid-question doubts, close keyboards, stats, error fallbacks, idempotency** | ✅ shipped |
 | 3 | Working memory + sessions | 3-4h | LLM explanations, session lifecycle, returning-after-break | ✅ shipped (incl. verification fixes) |
-| 4 | Planner + guardrails | 3-4h | Intent-driven routing, small_talk distinction, out-of-scope | ⏳ next |
-| 5 | Profile reads | 2-3h | Personalized responses, default difficulty, empty-state fallbacks | — |
+| 4 | Planner + guardrails | 3-4h | Intent-driven routing, small_talk distinction, out-of-scope, [Different subskill] picker | ✅ shipped (incl. 5 verification fixes) |
+| 5 | Profile reads | 2-3h | Personalized responses, default difficulty, empty-state fallbacks | ⏳ next |
 | 6 | Onboarding FSM | 3-4h | New-user flow with pause option + diagnostic + synthesis | — |
 | 7 | Session-end + extraction | 3-4h | Episodic memory + profile note growth | — |
 | 8 | Mentor + observer | 3-4h | Strategic responses + real-time pattern detection | — |
@@ -402,69 +402,83 @@ Real intent-driven routing. Single planner LLM call (Gemini Flash) replaces hard
 
 ### What's real (added on top of slice 3)
 
-- **Planner LLM call:** `services/orchestrator/planner.py` with `classify(message, recent_turns, active_session_summary)` returning IntentClassification. MODEL_PLANNER (Gemini Flash by default). Cost: ~$0.0001-0.0003 per call. Latency: ~1.5s added.
+- **Planner LLM call:** `services/orchestrator/planner.py` with `classify(message, recent_turns, active_session_summary)` returning IntentClassification. MODEL_PLANNER (Gemini Flash by default). Cost: ~$0.0001-0.0003 per call. Latency: ~500-1500ms added.
 - **Robust JSON parsing with safe defaults:** On planner failure, default to `intent.action = "small_talk"` (NOT practice_request — safer). The bot will ask what student wants rather than auto-serving.
 - **Granular subskill enum (Bug 22):** Planner returns one of 12 specific subskills (`inference_basic`, `inference_advanced`, `main_idea_full_passage`, `specific_detail`, etc.). VARC falls back to `inference_basic` and logs misclassification if planner returns out-of-enum.
 - **Mixed-intent secondary signal (Bug 15):** Planner returns `intent.secondary_signal` for messages with both action and emotional undertone (e.g., "I'm stressed, give me an easy one" → action=practice_request, difficulty=easy, secondary_signal={type:"emotional_undertone", value:"mild_stress"}).
 - **Small_talk vs practice_request distinction (Bug 15):** Planner prompt explicitly distinguishes brief acknowledgments (small_talk) from forward-intent (practice_request). When in doubt: small_talk. Bot responds with warm ack + continuation buttons, no question.
 - **Conditional context fetching:** Orchestrator fetches profile/episodic/specific_messages per `context_needs` from planner.
 - **Out-of-scope guardrails:** Quant/LRDI/general off-topic → templated soft-redirect (no agent invocation, no LLM call). Buttons: `[VARC question]` `[Strategy chat]`.
-- **Intent-driven routing:** orchestrator routes to varc / mentor (stub) / out_of_scope handler based on intent.domain + action. Step 6.5 deterministic detection (slice 2.5) still runs first, overriding planner where appropriate (skip callbacks, continuation callbacks, mid-question doubts, answer regex).
-
-- **Guardrails:** When `intent.domain == 'out_of_scope'`, orchestrator handles directly with soft-redirect, no agent invocation.
+- **Strategy chat callback:** `[Strategy chat]` tap → "what would you like to talk through?" open response (no buttons; next free-text message flows through planner like any other).
+- **Intent-driven routing:** orchestrator routes to varc / mentor (stub) / out_of_scope handler / orchestrator-direct (small_talk, stats, strategy_chat, subskill_picker) based on intent.domain + action. Step 6.5 deterministic detection (slice 2.5) still runs first, overriding planner where appropriate (skip callbacks, continuation callbacks, answer regex, retry, picker).
+- **v5fail test trigger removed:** real LLM error handling now wraps the openrouter calls via slice 3's `chat_with_metadata` retry-once + `_error_fallback_response` canned UI.
+- **[Different subskill] picker:** real implementation (slice 4 prompt called for it; placeholder shipped initially; verification fix completed it). 2-row 4-button keyboard. Top 3 weakest subskills (≥5 answered attempts, sorted by accuracy ASC) padded with defaults to always reach 4. Cold-start defaults: `[Inference (basic)]` `[Main idea]` `[Specific detail]` `[Inference (advanced)]`. Each button has callback_data `v5_continue_subskill_<subskill_name>`. Tap routes as practice_request with `intent.subskill` set.
+- **Keyboard reconstruction on idempotency retry:** `keyboard_json` persisted in `messages.metadata` at Step 12; Step 0's retry path reconstructs keyboard from metadata so duplicate-update_id deliveries return the full inline keyboard, not text-only.
 - **Response guidance:** Passed to agents in AgentContext. Agents are aware of `tone` and `should_acknowledge_feeling` (even if profile is still simple).
+
+### Slice 4 verification fixes (landed mid-cycle, all bundled into slice 4 commit)
+
+Five issues surfaced during verification testing. All shipped as part of slice 4:
+
+- **observer_events silent drop (slice 1 design gap, surfaced in slice 4):** AgentResponse carries `observer_events` as a delta. Earlier docs said `commit_deltas` would iterate and persist. `commit_deltas` was never built; the field was silently dropped across slices 1-4. Slice 4 was the first slice to populate it with non-empty content (out_of_scope_query in orchestrator, llm_failure in VARC). Fixed by adding `services/memory/main.py:persist_observer_event` helper. Each emission site calls the helper directly. The response's `observer_events` field is retained as metadata-only.
+
+- **`_error_fallback_response` refactor:** changed from sync to async, takes full `context` (not just `intent`) so it can populate the observer_event payload with student_id and session_id.
+
+- **Mid-question doubt detection over-eager (Bug 15 broken):** Step 6.5's deterministic mid-question doubt detector intercepted ANY free text typed during an open question, including small_talk like "thanks" / "ok" / "another." Fixed by adding `_looks_like_doubt` heuristic: messages ≤ 2 words without question marks or question words fall through to the planner. Real doubts ("what does premise mean?") still route deterministically. Practice requests during open questions correctly close the abandoned question's keyboard before serving the new one (Principle 2 path reused).
+
+- **[Different subskill] picker padding fix:** initial implementation returned `weakest[:4]`, which surfaced a 1-button picker for students with ≥5 attempts on only one subskill. Fixed by always padding with defaults to reach exactly 4 buttons.
+
+- **`close_session` atomicity (audit pass finding):** earlier `close_session` only did the Postgres UPDATE; callers (`cleanup_inactive_sessions`, future paths) were responsible for calling `clear_active_session` separately. Audit revealed the contract documented atomic behavior that didn't exist. Fixed by moving the Redis DEL into `close_session` itself: lookup `tg_id`, UPDATE Postgres (with COALESCE for double-close idempotency), DEL Redis. Every caller now inherits the cleanup automatically. `cleanup_inactive_sessions` simplified — JOIN to `v5.students` removed, redundant `clear_active_session` removed. `resolve_session`'s defensive staleness check kept for defense-in-depth.
 
 ### What's stubbed (still)
 
-- Profile brief: hardcoded minimal (no LLM-based personalization yet)
-- Episodic summaries: empty
-- Onboarding: not yet (assume all users post-onboarding)
-- Mentor: still stub, but orchestrator can route to it for `domain='mentor'`
+- Profile brief: hardcoded minimal (no LLM-based personalization yet) — slice 5
+- Episodic summaries: empty (`process_session_end` is a no-op stub) — slice 7
+- Onboarding: not yet (assume all users post-onboarding) — slice 6
+- Mentor: still stub; orchestrator routes to it for `domain='mentor'` but mentor returns a placeholder — slice 8
+- `get_default_difficulty`: not yet built; VARC uses hardcoded `DEFAULT_DIFFICULTY = "medium"` when `intent.difficulty` is null. Works today (everyone is cold-start) but breaks silently after slice 6 if students with `preparation_stage='revision'` exist. **Slice 5 must wire this.**
 
 ### Manual test
 
-1. Send "give me an inference question" → expected: practice flow as before
-2. Send "actually how is my progress overall?" → expected: planner classifies as `domain=mentor, action=review_progress`. Mentor stub returns hardcoded "Let me look at your progress". Real synthesis comes in slice 5+.
-3. Send "what's a good recipe for pasta?" → expected: planner classifies as `domain=out_of_scope`. Bot replies with soft-redirect: "I'm focused on CAT VARC..." plus offers to continue practice.
-4. Send "I'm so frustrated with this" → expected: planner classifies as `domain=mentor, action=vent, emotional_tone=frustrated`. Mentor stub returns simple acknowledgment. (Real warmth in slice 8.)
-5. Check Postgres:
-   ```sql
-   SELECT metadata->'intent_classification'->>'domain' FROM messages 
-   WHERE role='user' ORDER BY created_at DESC LIMIT 5;
-   -- Should show mix: 'varc', 'mentor', 'out_of_scope', etc.
-   
-   SELECT count(*) FROM observer_events WHERE event_type = 'out_of_scope_query';
-   -- Should be 1
-   ```
+Phase A: regression — verify slice 1-3 + 2.5 still work after the orchestrator refactor.
+Phase B: new behavior — test all 11+ scenarios per the slice 4 verification plan.
 
-### Completion criteria
-
-- [ ] Planner LLM call working (Gemini Flash via MODEL_PLANNER)
-- [ ] Intent classifications stored in messages.metadata
-- [ ] **Small_talk vs practice_request correctly distinguished (Bug 15):** "thanks" / "ok" / "got it" → small_talk + continuation buttons (NO new question); "another" / "next" → practice_request + new question
-- [ ] **Mixed-intent secondary signal works (Bug 15):** "I'm stressed, give me an easy one" → action=practice_request, secondary_signal captured, VARC tone adjusted
-- [ ] **Granular subskill from planner (Bug 22):** "main idea question" → planner returns `main_idea_full_passage` exactly
-- [ ] Out-of-scope queries get soft-redirect with `[VARC question]` `[Strategy chat]` buttons
-- [ ] Mentor stub invoked for `domain=mentor`
-- [ ] Out-of-scope queries don't invoke agents (cost savings)
-- [ ] Response guidance passes through to agents
-- [ ] **No regression:** all slice 1-3 + 2.5 behavior preserved
-- [ ] Default to `small_talk` on planner failure (NOT practice_request) — verify by temporarily breaking planner key
-- [ ] `v5fail` test trigger removed from VARC (real LLM failure handling now wraps the actual openrouter call)
-- [ ] Schema drift checker output matches expected (same as end-of-slice-3)
+Both phases plus the 5 verification fixes were exercised before slice 4 was committed. Send "give me an inference question" → practice flow. Type "thanks" during an open question → small_talk_ack (NOT mid_question_doubt_ack). Type "what does premise mean?" → mid_question_doubt_ack (planner bypassed). Send "solve 2x+3=7" → out_of_scope soft redirect with observer_event row in `v5.observer_events`. Tap `[Different subskill]` → 4-button picker. Curl-twice idempotency test → keyboard reconstructed.
 
 ### Migrations (slice 4)
 
-None new. Slice 4 is pure code (planner LLM + routing + LLM error handling around real calls). No schema changes.
+None new. Slice 4 is pure code (planner LLM + routing + observer_events inline persistence + close_session atomic + Step 6.5 heuristic + subskill picker + keyboard reconstruction). No schema changes.
 
 **Schema drift verification at end of slice 4:**
 ```bash
 .venv/bin/python -m scripts.check_schema_drift
 ```
 
-Expected: same 3 missing columns as end-of-slice-3 (slice 6 territory). No NEW drift introduced by slice 4.
+Expected: same 3 missing columns as end-of-slice-3 (slice 6 territory: `onboarding_paused_at`, `diagnostic_question_count`, `is_diagnostic`). No NEW drift introduced by slice 4. Exit code 1 (drift exists, but expected).
 
-### Estimated time: 3-4 hours
+### Completion criteria
+
+- [x] Planner LLM call working (Gemini Flash via MODEL_PLANNER)
+- [x] Intent classifications stored in messages.metadata
+- [x] Small_talk vs practice_request correctly distinguished (Bug 15) — including during open questions
+- [x] Mixed-intent secondary signal works (Bug 15)
+- [x] Granular subskill from planner (Bug 22)
+- [x] Out-of-scope queries get soft-redirect with `[VARC question]` `[Strategy chat]` buttons
+- [x] Out-of-scope queries persist `observer_events` row (slice 4 verification fix — `persist_observer_event` helper)
+- [x] LLM failures persist `llm_failure` observer_event for slice 8 observer to track
+- [x] [Different subskill] picker shows exactly 4 buttons regardless of attempt history
+- [x] [Strategy chat] callback works
+- [x] Keyboard reconstruction on idempotency retry redelivers full inline keyboard
+- [x] `close_session` atomically clears Redis state (audit finding fix)
+- [x] Mentor stub invoked for `domain=mentor`
+- [x] Out-of-scope queries don't invoke agents (cost savings)
+- [x] Response guidance passes through to agents
+- [x] No regression: all slice 1-3 + 2.5 behavior preserved
+- [x] Default to `small_talk` on planner failure (NOT practice_request)
+- [x] `v5fail` test trigger removed from VARC
+- [x] Schema drift checker output matches expected
+
+### Estimated time: 3-4 hours (actual: longer due to 5 verification fixes; closer to 6-8 hours)
 
 ---
 
@@ -472,16 +486,24 @@ Expected: same 3 missing columns as end-of-slice-3 (slice 6 territory). No NEW d
 
 ### Goal
 
-Replace hardcoded profile brief with real profile data. Responses become personalized. Default difficulty derived from profile (Bug 23). Empty-state fallbacks for new students (Bug 25).
+Replace hardcoded profile brief with real profile data. Responses become personalized. Default difficulty derived from profile (Bug 23 — slice 4 audit confirmed this is currently a hardcoded fallback in VARC; slice 5 fixes it). Empty-state fallbacks for new students (Bug 25).
+
+### Carry-over from slice 4
+
+The slice 4 audit pass surfaced that `get_default_difficulty` is documented in `02_service_contracts.md` but doesn't exist in code. VARC currently uses a hardcoded `DEFAULT_DIFFICULTY = "medium"` constant when `intent.difficulty` is null. This works today because every student is effectively cold-start (no `preparation_stage` populated until slice 6 onboarding lands). But after slice 6 ships, students with `preparation_stage='revision'` will silently get medium questions instead of hard.
+
+**Slice 5 must wire `get_default_difficulty` and thread it through AgentContext.** The function reads `student_profile.preparation_stage` and maps to "easy" | "medium" | "hard" per the contract. AgentContext gets a new `default_difficulty` field. VARC's `_handle_practice_request` reads from AgentContext.default_difficulty instead of the hardcoded constant.
+
+This is documented in `02_service_contracts.md` under `get_default_difficulty` with a "Status: function not built yet" note. Remove that status note when slice 5 ships.
 
 ### What's real (added on top of slice 4)
 
 - **Profile Service `get_tutor_brief`** — full implementation. Pulls from `v5.student_profile`, `v5.student_skill_profile`, `v5.student_notes`, recent episodic summaries (still empty until slice 7). Template-assembled string. NO LLM call.
 - **Empty-state fallbacks (Bug 25):** Students with <5 questions practiced get coherent friendly text, not "N/A" placeholders. Students with no recent sessions get "first time back since onboarding {N} days ago" or similar. Never empty sections.
 - **`get_minimal_brief`** — short version (~50-100 tokens) for low-context queries.
-- **`get_default_difficulty(student_id)` (Bug 23):** Derives from preparation_stage. `just_starting`→easy, `mid_prep`→medium, `final_3_months`→medium, `revision`→hard. Used by VARC when planner doesn't supply difficulty (replaces slice 4's "fall back to medium" heuristic with profile-aware derivation).
+- **`get_default_difficulty(student_id)` (Bug 23):** Derives from preparation_stage. `just_starting`→easy, `mid_prep`→medium, `final_3_months`→medium, `revision`→hard. Threaded through AgentContext as a new `default_difficulty` field. VARC's `_handle_practice_request` uses it when planner doesn't supply difficulty (replaces slice 4's hardcoded `DEFAULT_DIFFICULTY = "medium"` constant).
 - **`get_active_notes(student_id, filter)`:** SQL with `confidence × exp(-Δt / 30 days)` scoring (30-day half-life), top 20 ordered by score.
-- **Profile brief Redis cache:** `profile:brief:{student_id}` with 30-min TTL. Read in `get_tutor_brief`. Invalidated (DEL) on any write to student_notes/student_profile/student_skill_profile (Principle 6 — Bug 14 hardening).
+- **Profile brief Redis cache:** `profile:brief:{student_id}` with 30-min TTL. Read in `get_tutor_brief`. Invalidated (DEL) on any write to student_notes/student_profile/student_skill_profile (Principle 6 — Bug 14 hardening — operational starting slice 5 per the scope note in service contracts).
 - **Skill signals computed from `v5.student_question_attempts`:** top/bottom subskill (with min 5 attempts), recent accuracy, trap counts. Cached briefly in Redis (1-hour TTL).
 - **`/admin/notes/add` endpoint:** For manual note testing before slice 7 builds auto-extraction.
 
@@ -672,19 +694,29 @@ Expected output: ALL tables `[OK]`. Exit code 0. **If any drift remains, STOP an
 
 When sessions end, generate episodic summaries and extract profile notes via single combined LLM call (cost optimization). Profile grows organically. Returning-after-break (slice 3) now has rich summaries to draw from.
 
+### Carry-over from slice 4 audit pass (silent-drop pattern)
+
+The slice 4 audit pass surfaced a class of bug: deltas documented on AgentResponse that aren't iterated by the orchestrator. `observer_events` was the first; the audit confirmed `notes_proposed` is the next likely tripwire if slice 7 isn't careful.
+
+**Slice 7 implementation rule:** the extractor's notes do NOT flow back through `AgentResponse.notes_proposed`. The extractor runs in `process_session_end` (an async background pipeline, not in the request flow) and writes notes directly via `profile_service.add_note(...)`. There is no orchestrator iteration of any "notes" delta field.
+
+If you find yourself emitting `response.notes_proposed = [...]` from any handler during slice 7, STOP — that's the silent-drop pattern again. Persist via `add_note` directly at the emission site instead.
+
+This is documented in `02_service_contracts.md` "Cross-Service Contract: Persistence Pattern."
+
 ### What's real (added on top of slice 6)
 
-- **Memory Service `process_session_end(session_id)`:** Full pipeline. Single LLM call (MODEL_EXTRACTOR = Gemini Flash) returns JSON with: summary, topics, notes_to_add (with category, content, confidence, expires_after_days), skill_signals.
-- **Memory Service `cleanup_inactive_sessions`:** Cron, runs every 10 min. Closes sessions inactive > 30 min, triggers process_session_end for each.
+- **Memory Service `process_session_end(session_id)`:** Full pipeline. Single LLM call (MODEL_EXTRACTOR = Gemini Flash via `chat_with_metadata` + `record_llm_call` for observability) returns JSON with: summary, topics, notes_to_add (with category, content, confidence, expires_after_days), skill_signals. Notes are persisted directly via `profile_service.add_note` — NOT via a delta on the response.
+- **Memory Service `cleanup_inactive_sessions`:** Cron, runs every 10 min. Closes sessions inactive > 30 min via `close_session` (atomic Postgres + Redis DEL since slice 4 audit fix). Triggers `process_session_end` for each closed session.
 - **Profile Service extraction integration:** Adds notes from extraction LLM via `add_note` (which DELs cache per Principle 6). Reinforces matches against existing notes (substring overlap > 50%) instead of duplicating.
 - **Profile Service conflict resolution:** Basic rules — latest wins for category=context with expires_after_days; never override category=goal without explicit student statement.
-- **Episodic summaries used:** Planner can request them via `context_needs.episodic.needed`. Profile brief includes "recent activity" section drawing from latest summary.
+- **Episodic summaries used:** Planner can request them via `context_needs.episodic.needed`. Profile brief includes "recent activity" section drawing from latest summary. Slice 3's returning-after-break logic now references real episodic content (not just "we were on a {subskill} question").
 - **Note expiration:** category=context defaults to 14-day expiration. category=anxiety_pattern/skill_gap/goal: no expiration.
 
 ### What's stubbed (still)
 
 - Mentor reactive mode: slice 8
-- Mentor observer mode: slice 8 (raw signal source for slice 7's extractor)
+- Mentor observer mode: slice 8 (raw signal source for slice 7's extractor — slice 7 ships extractor; slice 8 ships the observer that produces signals into observer_events)
 
 ### Manual test
 

@@ -78,7 +78,7 @@ deleted_at           TIMESTAMP      (nullable, for soft-delete / GDPR)
 - Updated on every interaction (last_seen_at)
 - Soft-deleted on user request (sets deleted_at, doesn't actually remove)
 
-**Written by:** message_bus (creates row), orchestrator (updates last_seen_at), profile service (updates preferences)
+**Written by:** orchestrator (`_ensure_student` creates row on first message; updates `last_seen_at` on every turn), profile service (updates `preferences` — slice 5+).
 **Read by:** all services (resolve student_id from tg_id)
 
 ---
@@ -155,11 +155,12 @@ last_updated            TIMESTAMP DEFAULT now()
 
 **Lifecycle:**
 - Row created by orchestrator on first message (with all fields null except student_id)
-- Updated by onboarding FSM step-by-step
-- Updated occasionally by profile service when student explicitly states facts (e.g., "I'm now targeting 2027")
+- Updated by onboarding FSM step-by-step (slice 6)
+- Updated occasionally by profile service when student explicitly states facts (e.g., "I'm now targeting 2027") via `update_profile` (slice 6+)
+- For slices 1-4: ensure_profile creates the row with defaults; no other writes happen yet.
 
-**Written by:** orchestrator (FSM updates during onboarding), profile service (post-onboarding updates)
-**Read by:** profile service (assembling tutor brief), orchestrator (checking onboarding status)
+**Written by:** orchestrator's `_ensure_student` flow creates the initial row (current behavior). Onboarding FSM populates fields (slice 6). Profile service's `update_profile` for explicit fact updates (slice 6+).
+**Read by:** profile service (assembling tutor brief — slice 5+), orchestrator (checking onboarding status — slice 6).
 
 ---
 
@@ -244,14 +245,15 @@ sensitive            BOOLEAN DEFAULT false  (medical, mental health, family conf
 - `expires_at` (for nightly expiration job)
 
 **Lifecycle:**
-- Created by profile service during extraction (typically session-end)
-- Updated when reinforced (last_reinforced bumped)
-- Superseded when newer contradictory note created (superseded_by set, is_active = false)
-- Auto-deactivated when expires_at < now() (nightly cron)
-- Confidence decays based on category (life_events stable; emotional fast decay; preferences slow decay)
+- Created by profile service during extraction (typically session-end) — slice 7
+- Updated when reinforced (last_reinforced bumped) — slice 7
+- Superseded when newer contradictory note created (superseded_by set, is_active = false) — slice 7
+- Auto-deactivated when expires_at < now() (nightly cron) — slice 7
+- Confidence decays based on category (life_events stable; emotional fast decay; preferences slow decay) — slice 7
+- For slices 1-6: no writes happen yet; the table is empty in production. Slice 6 onboarding may add diagnostic-synthesis notes (TBD per slice 6 prompt).
 
-**Written by:** profile service exclusively
-**Read by:** profile service (assembling tutor brief), mentor agent (in observer mode)
+**Written by:** profile service exclusively (slice 7+). Currently no writes; table empty in production.
+**Read by:** profile service (assembling tutor brief — slice 5+), mentor agent (observer mode — slice 8).
 
 ---
 
@@ -362,8 +364,8 @@ For `role='system'` (rare; for system events like "session started"):
   - Contains a question → embed
   - Otherwise skip (most "thanks" / "ok" / button presses are skipped)
 
-**Written by:** orchestrator
-**Read by:** orchestrator (loading recent turns, idempotency check), memory service (embedding search), eval service (replay)
+**Written by:** orchestrator EXCLUSIVELY. User messages persist in Step 2 of `handle_message`; assistant messages persist in Step 12 with the assistant `keyboard_json` stored in metadata for idempotency-retry redelivery (slice 4 verification fix).
+**Read by:** orchestrator (loading recent turns, idempotency check, retry redelivery), memory service (working memory cache rehydration, embedding search), eval service (replay).
 
 ---
 
@@ -425,10 +427,10 @@ created_at            TIMESTAMP DEFAULT now()
 
 **`message_count` semantic:** counts ORCHESTRATOR TURNS, not individual messages. One turn = one user message + one assistant response = `+1`. If we later want a user-only count, that's a different column. (See DECISIONS.md "Slice 3 verification: message_count + Redis cleanup fixes".)
 
-**Critical invariant — Redis cleanup on close:** Every code path that closes a Postgres session MUST also clear the corresponding Redis state (`state:tg:{tg_id}`). This includes `cleanup_inactive_sessions`, explicit_end handlers, and any future session-close path. Failure to clear Redis leaves stale state that resolve_session has to detect on the next message — extra latency and a subtle Bug 13 surface. The invariant lives in code: `close_session` and its callers ALL DEL Redis state. (See Architectural Principles in `02_service_contracts.md`.)
+**Critical invariant — Redis cleanup on close:** Every code path that closes a Postgres session MUST also clear the corresponding Redis state (`state:tg:{tg_id}`). This is enforced structurally: `close_session` (in memory service) does the Postgres UPDATE and the Redis DEL atomically as one operation. Every caller (`cleanup_inactive_sessions` cron, explicit_end handlers, future session-close paths) inherits the cleanup automatically. Callers MUST NOT manually call `clear_active_session` after `close_session` — that's redundant. `resolve_session`'s defensive staleness check on every turn provides defense-in-depth. (See Architectural Principles in `02_service_contracts.md`.)
 
-**Written by:** orchestrator (create, update), session cleanup cron (close on inactivity)
-**Read by:** orchestrator (loading active session), memory service (closing session, generating summary), profile service (extraction context)
+**Written by:** memory service via `resolve_session` (INSERT on boundary; UPDATE per turn for `last_activity_at` + `message_count`) and `close_session` (atomic Postgres + Redis close). Cleanup cron calls `close_session` for inactive sessions.
+**Read by:** orchestrator (loading active session), memory service (closing session, generating summary in slice 7+), profile service (extraction context — slice 7+).
 
 ---
 
@@ -494,13 +496,14 @@ created_at           TIMESTAMP DEFAULT now()
 - HNSW index on `embedding` (for v2+ semantic search)
 
 **Lifecycle:**
-- Created by memory service at session-end via combined LLM call (summary + extraction)
-- Embeddings populated asynchronously
+- Created by memory service at session-end via combined LLM call (summary + extraction) — slice 7
+- Embeddings populated asynchronously — slice 7
 - Never updated; new sessions create new summaries
 - Old summaries (90+ days) may eventually be consolidated into weekly rollups (v2+)
+- For slices 1-6: no writes happen yet; `process_session_end` is a no-op stub. Table is empty in production.
 
-**Written by:** memory service (session-end pipeline)
-**Read by:** profile service (assembling tutor brief), orchestrator (when planner requests episodic context)
+**Written by:** memory service via `process_session_end` (slice 7+). Currently a no-op stub; table empty.
+**Read by:** profile service (assembling tutor brief — slice 5+), orchestrator (when planner requests episodic context — slice 4+ via context_needs.episodic).
 
 ---
 
@@ -565,12 +568,14 @@ out_of_scope_query            (for guardrail tracking)
 - `(student_id, created_at DESC)` (for analytics)
 
 **Lifecycle:**
-- Created by orchestrator (or VARC agent) inline during request handling
-- Processed by mentor observer (inline, after response sent) OR by background job (v2+)
-- Never deleted; functions as audit log
+- INSERTed by `services.memory.main.persist_observer_event` (slice 4 verification fix). Best-effort: failures are logged and swallowed; user response is never blocked.
+- Each emission site calls `persist_observer_event` directly. The `observer_events` field on `AgentResponse` is metadata-only and is NOT iterated by the orchestrator. Adding a new event type means adding the helper call at the new emission site.
+- Currently 2 emission sites: `out_of_scope_query` (orchestrator's `_build_out_of_scope_response`), `llm_failure` (VARC's `_error_fallback_response`). Slice 8 mentor observer adds more.
+- Processed by mentor observer (inline, after response sent) OR by background job (v2+) — slice 8 work.
+- Never deleted; functions as audit log.
 
-**Written by:** orchestrator, VARC agent (via memory_deltas)
-**Read by:** mentor observer (consumes events, marks processed), analytics dashboard
+**Written by:** orchestrator (out_of_scope_query), VARC (llm_failure), mentor observer (slice 8) — ALL via `persist_observer_event` helper. No service writes directly via INSERT.
+**Read by:** mentor observer (consumes events, marks processed — slice 8), analytics dashboard.
 
 ---
 
@@ -656,8 +661,8 @@ fallback_tier        SMALLINT         (1-6, which tier of the retrieval ladder s
 - An attempt with `answered_at IS NULL` and `skipped = FALSE` represents an "open question" the student hasn't engaged with yet. There can be at most one open question per student at a time (enforced by application logic, not DB constraint).
 - Skipped attempts (`skipped = TRUE`) are still considered "seen" by the retrieval ladder — the student saw the question even if they didn't answer it.
 
-**Written by:** VARC agent (insert on serve, update on answer/skip)
-**Read by:** VARC agent (retrieval ladder seen-set query, last-unanswered lookup), profile service (skill signal calculation), session-end pipeline (extraction context)
+**Written by:** VARC agent EXCLUSIVELY. INSERT in `_record_attempt` on question serve. UPDATE inline in `_handle_answer` (sets `answered_at`, `is_correct`, `student_answer`, `explanation_shown`) and `_handle_skip` (sets `answered_at`, `skipped=true`, `explanation_shown=true`). Orchestrator does NOT write to this table.
+**Read by:** VARC agent (retrieval ladder seen-set query, last-unanswered lookup), profile service (skill signal calculation, slice 5+), session-end pipeline (extraction context, slice 7+).
 
 ---
 
@@ -1238,11 +1243,11 @@ AgentResponse {
     } (nullable)
   }
   
-  observer_events: [                       // events to insert into observer_events table
-    {
-      event_type: string
-      payload: object
-    }
+  observer_events: [                       // metadata-only; the orchestrator does NOT iterate this.
+    {                                      // Each emission site MUST call persist_observer_event
+      event_type: string                   // directly. Failing to do so silently drops the event.
+      payload: object                      // Field is retained on the response for clarity at the
+    }                                      // emission site and for potential future centralization.
   ]
   
   meta: {
@@ -1420,24 +1425,26 @@ Orchestrator:
   8. Assemble AgentContext
   9. Route to agent (VARC or Mentor)
   10. Agent retrieves question (if needed) from questions table via pgvector
-  11. Agent makes generation LLM call
+  11. Agent makes generation LLM call (logged via record_llm_call)
   12. Agent returns AgentResponse
-  13. Insert assistant message → messages table
-  14. Apply memory_deltas:
-      - Update Redis active session
-      - Update sessions table (message_count, etc.)
-      - Insert observer_events → observer_events table
-      - Insert attempt → attempts table (if answering question)
+  13. Insert assistant message → messages table (orchestrator owns this INSERT). Persist keyboard_json in metadata for idempotency-retry redelivery.
+  14. Inline persistence (each at emission site, NOT centralized):
+      - Per-turn UPDATE on sessions: bumps last_activity_at + message_count (handled in resolve_session at start of turn)
+      - Active Redis state already updated at relevant touchpoints
+      - VARC's INSERT/UPDATE on student_question_attempts done inline within VARC's handlers
+      - observer_events INSERTed by emission sites via persist_observer_event helper (NOT iterated from response)
   15. Increment ratelimit, spend counters
   16. Return response → bus
   17. Release lock
-  18. (Async) Run inline mentor observer
+  18. (Async) Run inline mentor observer (slice 8)
   19. (Async) Embedding job for messages
 
 Session-end cron (every 10 min):
-  - Find sessions where last_activity_at > 45 min ago AND ended_at IS NULL
-  - For each: combined LLM call generates summary + extracts notes
-  - Insert episodic_summary, upsert student_notes, mark session ended
+  - Find sessions where last_activity_at > 30 min ago AND ended_at IS NULL
+  - For each: call close_session (atomic Postgres + Redis DEL); call process_session_end (slice-3 stub; slice 7 wires real summary + notes extraction)
+  - Combined LLM call generates summary + extracts notes (slice 7+)
+  - Insert episodic_summary, upsert student_notes (slice 7+)
+
 ```
 
 ---

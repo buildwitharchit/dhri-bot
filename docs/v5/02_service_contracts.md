@@ -108,7 +108,9 @@ The tutor brief Redis cache (`profile:brief:{student_id}`) gets stale fast. Note
 
 **Rule:** ANY service that writes to `student_notes`, `student_profile`, or `student_skill_profile` MUST invalidate `profile:brief:{student_id}` in Redis immediately, even if the write is async.
 
-**Enforcement:**
+**Scope note (slices 1-4):** This principle is forward-looking. The `profile:brief` Redis cache itself doesn't exist yet; `get_tutor_brief` returns a stub string in slices 1-4. Slice 5 wires the cache and the cache invalidation rule becomes operational. Until slice 5 ships, every site documented under "Enforcement" below will need to add the DEL call as part of its slice 5+ implementation. Track this in slice 5's prompt.
+
+**Enforcement (active from slice 5+):**
 - Profile service's `add_note`, `reinforce_note`, `supersede_note`, `update_profile` all DEL the cache key as their last step
 - Memory service's session-end pipeline (which calls profile service to add notes) inherits this guarantee
 - Mentor observer (which calls profile service) inherits this guarantee
@@ -196,6 +198,12 @@ Helper for closing or replacing inline keyboards on previously-delivered Telegra
 - Calls `editMessageReplyMarkup` on the target message.
 - `new_keyboard=None` clears the keyboard entirely.
 - Catches all errors (message too old, deleted, etc.) — logs warning, returns `False`. Never raises. Never blocks response delivery.
+
+### `services.memory.main.persist_observer_event(student_id, session_id, event_type, payload=None)`
+
+Best-effort INSERT into `v5.observer_events`. Documented fully in Service 3 (Memory Service) below. Mentioned here because it's a cross-cutting concern: any code path emitting an observer event (orchestrator's out_of_scope_query, VARC's llm_failure, slice 8's mentor observer events) calls this directly.
+
+**Required pattern:** every emission site MUST call `persist_observer_event` directly. The `observer_events` field on `AgentResponse` is metadata-only and is NOT iterated by the orchestrator. Failing to call this helper at the emission site silently drops the event (this was the slice 4 verification bug).
 
 ---
 
@@ -546,26 +554,23 @@ Returns AgentResponse.
 - Send canned error to user: "Hmm, something went wrong saving that. Try once more?"
 - Release lock and exit
 
-#### Step 13: Apply memory deltas
+#### Step 13: Inline persistence (no centralized iteration)
 
-From `response.memory_deltas`:
-- Update Redis active session (LPUSH new turn, update domain_state)
-- **If response served a new question:** update `state:tg:{tg_id}.last_question_message_id` and `last_question_attempt_id` after Telegram delivers
-- Update `sessions` table (message_count++, question_count if applicable)
-- Insert observer events from `response.observer_events`
-- Insert/update student_question_attempts row if applicable:
-  - On answer: UPDATE existing row (set answered_at, is_correct, student_answer, explanation_shown)
-  - On skip: UPDATE existing row (set answered_at, skipped=true, explanation_shown)
-  - On new question serve: INSERT new row (student_id, question_id, served_at, fallback_tier)
+**Persistence in v5 is inline at the emission site, not centralized in a `commit_deltas` step.** What was historically called "applying memory deltas" is actually distributed across several earlier steps and across services:
 
-If `response.memory_deltas.close_session` is set:
-- Mark session as ended
-- Trigger session-end pipeline (async)
+- **Assistant message persistence** — happens in Step 12 above (orchestrator's INSERT into `v5.messages`).
+- **Sessions table updates** — handled by `resolve_session` (which performs the per-turn UPDATE bumping `last_activity_at` and `message_count` together) at the start of the turn, and `close_session` at session boundaries. The orchestrator does not bump session counters here.
+- **Active session Redis state** — updated by orchestrator and memory service inline as state changes (e.g., setting `last_question_message_id` after Telegram delivers a question with `requires_keyboard_close`). Done before this step in the relevant flows.
+- **Student question attempts** — VARC handles its own attempt persistence inline. INSERT in `_record_attempt` on serve; UPDATEs in `_handle_answer` and `_handle_skip`. The orchestrator does not write to this table.
+- **Observer events** — emission sites call `persist_observer_event` directly. The `response.observer_events` field is metadata-only and is NOT iterated by the orchestrator. Adding a new observer_event type requires calling `persist_observer_event` at the emission site.
+- **LLM call logs** — every LLM call site (orchestrator's planner, VARC's explanation/skip/resume, future mentor calls) calls `record_llm_call` immediately after the LLM response. Orchestrator does not iterate.
 
-**On memory delta write failure:**
-- Log loud
+**On any persistence failure:**
+- The relevant emission site logs and (for best-effort writes like `record_llm_call` and `persist_observer_event`) swallows the exception
 - The user has already seen the response — DO NOT crash
-- State will be slightly inconsistent (next session might miss this turn's context); acceptable per Principle 5
+- State may be slightly inconsistent; acceptable per Principle 5
+
+**This is a deliberate architectural choice.** Earlier drafts of this document described a centralized `commit_deltas` function that would iterate the `memory_deltas` field on the response and dispatch writes per delta type. That function was never built. The slice 4 verification audit confirmed that the alternative — inline persistence at each emission site — is what the codebase actually does, and works correctly. See DECISIONS.md "Slice 4 verification: inline persistence pattern" for rationale.
 
 #### Step 14: Increment counters
 
@@ -945,32 +950,59 @@ LIMIT $limit
 - Only operates on messages with populated embeddings (~30% of all messages typically)
 - v1: this function may return empty results often if embeddings aren't yet populated. That's fine — it's a v2+ feature mostly.
 
-### `commit_deltas(student_id, tg_id, deltas)`
+### Persistence pattern: inline at emission site
 
-**Input:** student_id, tg_id, MemoryDeltas object (from agent response)
+Earlier drafts of this contract described a centralized `commit_deltas(student_id, tg_id, deltas)` function that would dispatch persistence based on a `MemoryDeltas` object on the agent response. **That function was never built and the pattern is not used.** Persistence in v5 is inline at the emission site — each service writes directly to its owned tables.
 
-**Output:** Success
+The actual persistence map:
 
-**Internal flow:**
-- If `deltas.new_assistant_turn`: append_turn (Redis only; orchestrator already wrote to Postgres)
-- If `deltas.active_context_updates`: update_active_session
-- If `deltas.new_session`: insert into sessions table, set_active_session
-- If `deltas.close_session`: update sessions table (ended_at, end_reason), trigger async session-end pipeline
-- If `deltas.attempt_record`: insert into attempts table
+- **`v5.messages`**: orchestrator writes assistant messages directly via its INSERT in Step 12 of `handle_message`. User messages also persist directly in Step 2.
+- **`v5.sessions`**: `resolve_session` creates new sessions; per-turn UPDATE bumps `last_activity_at` + `message_count`; `close_session` handles closing.
+- **Redis active state**: orchestrator and memory service call `set_active_session` / `update_active_session` / `clear_active_session` directly when state changes.
+- **`v5.student_question_attempts`**: VARC writes attempts directly via `_record_attempt` (INSERT on serve) and inline UPDATEs on answer/skip. Orchestrator does NOT touch this table.
+- **`v5.observer_events`**: each emission site calls `persist_observer_event` from memory service. Currently 2 sites: out_of_scope_query in orchestrator, llm_failure in VARC. Slice 8 will add mentor observer events through the same helper.
+- **`v5.llm_calls`**: each LLM call site calls `record_llm_call` from `shared.observability.llm_log`. Best-effort; never blocks delivery.
+- **`v5.student_notes`**: writes land in slice 7 (extractor) via a dedicated helper. Onboarding-specific notes in slice 6.
+- **`v5.episodic_summaries`**: writes land in slice 7 (session-end pipeline).
 
-### `close_session(session_id, end_reason)`
+The `observer_events` field on `AgentResponse` is metadata-only — it exists in the response shape so future centralization work could potentially harvest it, but it is NOT iterated by the orchestrator. **Adding a new observer_event type requires calling `persist_observer_event` directly at the emission site.** Failing to do so silently drops the event (this was the slice 4 verification bug).
+
+### `persist_observer_event(student_id, session_id, event_type, payload=None)` — slice 4 verification fix
+
+Location: `services/memory/main.py`.
+
+Best-effort INSERT into `v5.observer_events`. Wraps the INSERT in try/except; on failure, logs warning and returns. The user-facing response is NEVER blocked by an event-persistence failure (Principle 5).
+
+**Usage pattern (pseudocode):**
+
+```python
+# At any emission site (orchestrator, VARC, future mentor):
+await persist_observer_event(
+    student_id=student_id,
+    session_id=session_id,
+    event_type="out_of_scope_query",
+    payload={"original_message": user_message[:500],
+             "domain_classified": intent.get("domain"),
+             "action_classified": intent.get("action")},
+)
+```
+
+The `event_id` and `created_at` columns are populated by Postgres defaults (`gen_random_uuid()` and `now()`); helpers do not pass them.
+
+### `close_session(session_id, end_reason)` — atomic Postgres + Redis (slice 4 verification fix)
 
 **Input:** session_id, end_reason
 
-**Output:** Success
+**Output:** None
 
 **Internal flow:**
-1. Look up `tg_id` for this session: `SELECT s.tg_id FROM v5.students s JOIN v5.sessions sess ON sess.student_id = s.student_id WHERE sess.session_id = $1`
-2. UPDATE sessions SET ended_at = now(), end_reason = ? WHERE session_id = ?
-3. **DEL `state:tg:{tg_id}` in Redis** (Principle 3 invariant — every session-close path clears Redis)
-4. Trigger session-end pipeline (async — see below)
+1. Look up `tg_id` via JOIN to `v5.students` (BEFORE the UPDATE — handles the case where session is already closed, idempotent).
+2. UPDATE sessions: `SET ended_at = COALESCE(ended_at, now()), end_reason = COALESCE(end_reason, $2)`. The `COALESCE` makes double-close a safe no-op — the original close timestamp/reason are preserved if a second call comes in.
+3. DEL `state:tg:{tg_id}` in Redis (via `clear_active_session`). Unconditional once we have a `tg_id`.
 
-**Critical:** every caller of `close_session` (cleanup cron, explicit_end handlers, error paths, future slice 4 session-switch path) inherits the Redis cleanup automatically. NO caller should manually skip step 3.
+**Critical invariant:** `close_session` is the structural enforcement point for Principle 3. Every caller (cleanup cron, explicit_end handlers, error paths, future session-switch paths) inherits the Redis cleanup automatically. **Callers MUST NOT call `clear_active_session` themselves after `close_session`** — that's redundant, and a sign someone didn't trust the contract.
+
+`resolve_session` retains its defensive staleness check on every turn (DEL Redis if Postgres says ended_at IS NOT NULL) for defense in depth — protects against any future code path that closes a session via direct SQL or some backdoor.
 
 ### Session-End Pipeline (`process_session_end(session_id)`)
 
@@ -1018,16 +1050,16 @@ LIMIT $limit
 **Trigger:** Cron every 10 minutes (configured externally — Railway cron, cron-job.org, GitHub Actions, etc.)
 
 **Internal flow:**
-1. SQL — find inactive sessions, joined with student tg_id:
+1. SQL — find inactive sessions:
    ```sql
-   SELECT s.session_id, s.student_id, st.tg_id
+   SELECT s.session_id
    FROM v5.sessions s
-   JOIN v5.students st ON st.student_id = s.student_id
    WHERE s.ended_at IS NULL
      AND s.last_activity_at < now() - interval '30 minutes'
    ```
-2. For each row, call `close_session(session_id, 'inactivity_timeout')`. `close_session` itself handles the Redis state cleanup (per its updated contract above — DELs `state:tg:{tg_id}`).
-3. Returns count of closed sessions.
+2. For each row, call `close_session(session_id, 'inactivity_timeout')`. `close_session` does its own JOIN to `v5.students` to lookup `tg_id` and clears Redis state internally — cleanup_inactive_sessions does NOT need to JOIN or call `clear_active_session` itself.
+3. Call `process_session_end(session_id)` (slice-3 stub; slice 7 wires real summary + notes extraction).
+4. Returns count of closed sessions.
 
 **Critical: 30-min threshold matches the session-boundary detection logic in `resolve_session`.** Both use `last_activity_at + 30 min` as the cutoff. Any change to one MUST change the other.
 
@@ -1043,7 +1075,7 @@ LIMIT $limit
 ## Service 4: Profile Service
 
 Owns: student_profile, student_notes.
-Reads: student_skill_profile (the renamed v4 table), messages (for source attribution).
+Reads: `public.user_profiles` for v4 skill stats (slice 5+; this v4 table will be renamed to `v5.student_skill_profile` at v4 retirement, hence the "student_skill_profile" naming used throughout the contract). For slices 1-4, profile service does not read skill data; it returns stub values.
 
 ### `ensure_profile(student_id)`
 
@@ -1056,7 +1088,7 @@ Reads: student_skill_profile (the renamed v4 table), messages (for source attrib
 2. If not exists, INSERT a row with defaults (target_exam='CAT', onboarding_complete=false)
 3. Return row
 
-### `update_profile(student_id, updates)`
+### `update_profile(student_id, updates)` — slice 6
 
 **Input:** student_id, updates dict (e.g., { target_year: 2027, hours_per_day: '4-6' })
 
@@ -1066,6 +1098,8 @@ Reads: student_skill_profile (the renamed v4 table), messages (for source attrib
 1. UPDATE student_profile SET (each field), last_updated = now() WHERE student_id = ?
 2. Invalidate tutor brief cache: DEL `profile:brief:{student_id}`
 3. Return updated row
+
+**Status:** function not built yet. Slice 6's onboarding FSM is the first caller. Slice 5 may also use it for explicit profile-fact updates (revisit during slice 5 prompt drafting).
 
 ### `get_tutor_brief(student_id)`
 
@@ -1136,7 +1170,7 @@ Reads: student_skill_profile (the renamed v4 table), messages (for source attrib
 
 **Notes:** Used when planner says profile context is "minimal". Saves tokens.
 
-### `get_default_difficulty(student_id)` — Bug 23
+### `get_default_difficulty(student_id)` — Bug 23 — slice 5
 
 **Input:** student_id
 
@@ -1153,6 +1187,8 @@ Reads: student_skill_profile (the renamed v4 table), messages (for source attrib
 4. Return string
 
 **Notes:** Called by orchestrator when constructing AgentContext. Used by VARC agent when `intent.difficulty` from planner is null. ~5ms typical (single SELECT, can be cached briefly with student profile).
+
+**Status:** function not built yet. Slice 4 verification confirmed VARC currently falls back to a hardcoded `DEFAULT_DIFFICULTY = "medium"` constant in `_handle_practice_request` when `intent.difficulty` is null. This works today because every student is effectively cold-start (no `preparation_stage` populated until slice 6 onboarding lands), so the hardcode happens to match what `get_default_difficulty` would return. **After slice 6 ships profile data, this stub MUST be replaced or students with `preparation_stage='revision'` will silently get medium questions instead of hard.** Slice 5 implements the real function and threads `default_difficulty` through AgentContext. See DECISIONS.md "Slice 4 audit findings" for the trace.
 
 ### `get_session_stats(student_id, session_id=None)` — Bug 12
 
@@ -1207,7 +1243,7 @@ Plus aggregation by subskill (which subskills appeared, accuracy per subskill).
 - Used when student taps `[Show my session stats]` continuation button. Pure SQL, no LLM. ~30ms typical.
 - Orchestrator passes `intent.action == "stats_request"` to this; the response is composed by the orchestrator (not by an agent) using the returned dict. See orchestrator's Step 10 routing for stats_request.
 
-### `add_note(student_id, note_data)`
+### `add_note(student_id, note_data)` — slice 7
 
 **Input:**
 - student_id: UUID
@@ -1225,7 +1261,9 @@ Plus aggregation by subskill (which subskills appeared, accuracy per subskill).
 4. **Invalidate tutor brief cache: DEL `profile:brief:{student_id}`** (Principle 6 — mandatory)
 5. Return note_id
 
-### `reinforce_note(note_id)`
+**Status:** function not built yet. Slice 7's session-end extractor is the first caller. Slice 6 onboarding may also use it for diagnostic synthesis notes (TBD per slice 6 prompt).
+
+### `reinforce_note(note_id)` — slice 7
 
 **Input:** note_id
 
@@ -1238,7 +1276,9 @@ Plus aggregation by subskill (which subskills appeared, accuracy per subskill).
    WHERE note_id = ?
 2. Invalidate tutor brief cache
 
-### `supersede_note(old_note_id, new_note_data)`
+**Status:** function not built yet.
+
+### `supersede_note(old_note_id, new_note_data)` — slice 7
 
 **Input:** old_note_id, new_note_data
 
@@ -1249,6 +1289,8 @@ Plus aggregation by subskill (which subskills appeared, accuracy per subskill).
 2. Update old note: SET superseded_by = new_note_id, is_active = false
 3. Invalidate tutor brief cache
 4. Return new note_id
+
+**Status:** function not built yet.
 
 ### `get_active_notes(student_id, filter)`
 
@@ -1455,7 +1497,7 @@ if results: return (results[0], tier=6)
 return (None, tier=0)
 ```
 
-### `serve_diagnostic_question(student_id, q_index)`
+### `serve_diagnostic_question(student_id, q_index)` — slice 6
 
 **Input:** student_id, q_index (1-5)
 
@@ -1472,7 +1514,9 @@ return (None, tier=0)
 - Compose presentation (briefer than normal practice; "Question 3 of 5:")
 - Return AgentResponse with question + keyboard
 
-### `handle_diagnostic_answer(student_id, current_step, normalized_payload)`
+**Status:** function not built yet. Slice 6's onboarding FSM is the first caller. Diagnostic mode is the documented exception to Principle 1 (auto-continue between Q1-Q4); see slice 6 design notes.
+
+### `handle_diagnostic_answer(student_id, current_step, normalized_payload)` — slice 6
 
 **Input:** student_id, current step name, payload
 
@@ -1482,10 +1526,12 @@ return (None, tier=0)
 - Get current question from session domain_state
 - Determine correctness, trap if any
 - Brief explanation (less detailed than normal — preserve diagnostic momentum)
-- Record attempt
-- Update student_skill_profile
+- Record attempt with `is_diagnostic = true`
+- Update student_skill_profile (slice 5 wires this; slice 6 may stub if needed)
 - Update onboarding_step to next (q2, q3, ... or 'mentor_synthesis')
 - Return response
+
+**Status:** function not built yet.
 
 ### What VARC Agent does NOT do
 
@@ -1751,36 +1797,30 @@ Not a separate service in v1, but a clearly defined sub-component.
 
 ---
 
-## Cross-Service Contracts: Memory Deltas
+## Cross-Service Contract: Persistence Pattern
 
-When agents return AgentResponse, the `memory_deltas` field is the contract for state changes. Orchestrator processes these in order:
+Earlier drafts of this contract specified that agents would return a `memory_deltas` field on AgentResponse, and the orchestrator would iterate the deltas in a centralized commit step. **That pattern was never built. v5 uses inline persistence — each service writes directly to its owned tables at the emission site.**
+
+The current persistence map:
 
 ```
-memory_deltas {
-  new_assistant_turn: {
-    content, content_type, metadata
-  }
-  
-  active_context_updates: {
-    domain_state: {...},  // partial update
-    message_count_in_session: int  // increment by N
-  }
-  
-  new_session: {  // if creating new session
-    primary_agent, started_at
-  }
-  
-  close_session: {  // if closing
-    session_id, end_reason
-  }
-  
-  attempt_record: {  // if answering a question
-    question_id, selected_option, correct, time_taken_seconds
-  }
-}
+v5.messages              → orchestrator INSERT (Step 12, assistant; Step 2, user)
+v5.sessions (INSERT)     → memory.resolve_session (boundary path)
+v5.sessions (UPDATE)     → memory.resolve_session (continuation; bumps last_activity_at + message_count)
+                         → memory.close_session (boundary close; atomic with Redis DEL)
+Redis state:tg:{tg_id}   → memory.set_active_session / update_active_session / clear_active_session
+                         → memory.close_session (clears as part of close)
+v5.student_question_attempts (INSERT)  → varc._record_attempt
+v5.student_question_attempts (UPDATE)  → varc._handle_answer / _handle_skip (inline)
+v5.observer_events       → memory.persist_observer_event (called at each emission site)
+v5.llm_calls             → shared.observability.llm_log.record_llm_call (called after each LLM call)
+v5.student_notes         → profile.add_note / reinforce_note / supersede_note (slice 7+)
+v5.episodic_summaries    → memory.process_session_end (slice 7)
 ```
 
-Orchestrator commits these atomically where possible. If any step fails, log loud and continue (don't lose user-facing response over a memory write hiccup).
+`AgentResponse` retains an `observer_events` field for clarity at the emission site (a developer reading VARC's `_error_fallback_response` can see what kind of event is being emitted), but **the field is metadata-only — the orchestrator does NOT iterate it.** Adding a new event type requires calling `persist_observer_event` at the emission site. Failing to do so silently drops the event (this was the slice 4 verification bug).
+
+If a future slice (slice 8 mentor observer, post-v1.5 refactor) wants to centralize persistence, it can iterate the `observer_events` field at that point. Until then, inline at emission is the rule.
 
 ---
 
@@ -1832,39 +1872,42 @@ clear_active_session(tg_id) → bool
 detect_session_resume_candidate(student_id) → ResumeCandidate | None  # Bug 2
 get_episodic_summaries(student_id, filter) → [EpisodicSummary]
 embedding_search_messages(student_id, query, limit=5) → [Message]
-commit_deltas(student_id, tg_id, deltas) → bool
-close_session(session_id, end_reason) → bool  # also DELs Redis state for tg_id
+persist_observer_event(student_id, session_id, event_type, payload=None) → None  # slice 4 verification fix; best-effort
+close_session(session_id, end_reason) → None  # atomic Postgres + Redis DEL
 process_session_end(session_id) → bool  # async pipeline; slice 3 stub, slice 7 real
 cleanup_inactive_sessions() → int        # cron; returns count of closed sessions
 
+
 # Profile Service
 ensure_profile(student_id) → ProfileRow
-update_profile(student_id, updates) → ProfileRow
-get_tutor_brief(student_id) → string
-get_minimal_brief(student_id) → string
-get_default_difficulty(student_id) → "easy" | "medium" | "hard"  # Bug 23
+update_profile(student_id, updates) → ProfileRow                              # slice 6 (not built yet)
+get_tutor_brief(student_id) → string                                          # stub in 1-4; real in slice 5
+get_minimal_brief(student_id) → string                                        # stub in 1-4; real in slice 5
+get_default_difficulty(student_id) → "easy" | "medium" | "hard"  # Bug 23     # slice 5 (not built yet)
 get_session_stats(student_id, session_id=None) → SessionStats  # Bug 12; session_id required slice 3+
-add_note(student_id, note_data) → note_id  # invalidates profile:brief cache
-reinforce_note(note_id) → bool  # invalidates profile:brief cache
-supersede_note(old_note_id, new_note_data) → new_note_id  # invalidates profile:brief cache
-get_active_notes(student_id, filter) → [Note]
-decay_confidences() → bool  # cron
+add_note(student_id, note_data) → note_id  # invalidates profile:brief cache  # slice 7 (not built yet)
+reinforce_note(note_id) → bool  # invalidates profile:brief cache             # slice 7 (not built yet)
+supersede_note(old_note_id, new_note_data) → new_note_id                      # slice 7 (not built yet)
+get_active_notes(student_id, filter) → [Note]                                 # slice 5 (not built yet)
+decay_confidences() → bool  # cron                                            # slice 7 (not built yet)
 
 # VARC Agent
 handle(context) → AgentResponse  # all flows: practice/answer/skip/doubt/concept/switch/end/resume
-serve_diagnostic_question(student_id, q_index) → AgentResponse
-handle_diagnostic_answer(student_id, current_step, payload) → AgentResponse
+serve_diagnostic_question(student_id, q_index) → AgentResponse                # slice 6 (not built yet)
+handle_diagnostic_answer(student_id, current_step, payload) → AgentResponse   # slice 6 (not built yet)
 
 # Mentor Agent
-handle(context) → AgentResponse
-synthesize_diagnostic(student_id) → AgentResponse
-handle_skip_diagnostic(student_id) → AgentResponse
-inline_observe(student_id, session_id, recent_turn, agent_response) → None  # async
+handle(context) → AgentResponse                                               # slice 8 (stub in 1-7)
+synthesize_diagnostic(student_id) → AgentResponse                             # slice 6 (not built yet)
+handle_skip_diagnostic(student_id) → AgentResponse                            # slice 6 (not built yet)
+inline_observe(student_id, session_id, recent_turn, agent_response) → None  # async  # slice 8 (not built yet)
 
 # Planner (sub-component)
-classify(message, recent_turns, active_session_summary) → IntentClassification
+classify(message, recent_turns, active_session_summary) → IntentClassification  # slice 4
 
 # Shared infrastructure (slice 3+)
 chat_with_metadata(system, user, model) → LLMCallResult                              # OpenRouter call w/ tokens+cost+latency
 record_llm_call(service, purpose, result, *, student_id, session_id, message_id) → None  # best-effort
+persist_observer_event(student_id, session_id, event_type, payload=None) → None  # best-effort; slice 4
 ```
+
