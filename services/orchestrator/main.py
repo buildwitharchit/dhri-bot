@@ -38,7 +38,13 @@ from services.memory.main import (
     resolve_session,
 )
 from services.orchestrator import planner as planner_module
-from services.profile.main import ensure_profile, get_minimal_brief, get_session_stats
+from services.profile.main import (
+    ensure_profile,
+    get_default_difficulty,
+    get_minimal_brief,
+    get_session_stats,
+    get_tutor_brief,
+)
 from services.varc.main import handle as varc_handle
 from services.mentor.main import handle as mentor_handle
 from shared.telegram.utils import escape_html
@@ -518,14 +524,20 @@ async def _route_intent(
     if action == "stats_request":
         return await _build_stats_response(student_id, session_id)
 
-    # Agent invocation (varc / mentor).
+    # Agent invocation (varc / mentor). Slice 5: profile_brief is dispatched
+    # per planner's context_needs.profile, and default_difficulty is threaded
+    # through (replacing VARC's slice-2-era hardcoded "medium" — Bug 23).
+    profile_brief_text = await _resolve_profile_brief(student_id, context_needs)
+    default_difficulty = await get_default_difficulty(student_id)
+
     agent_context = {
         "student_id": student_id,
         "tg_id": tg_id,
         "session_id": session_id,
         "session_resume_candidate": resume_candidate,
         "recent_turns": recent_turns,
-        "profile_brief": await get_minimal_brief(student_id),
+        "profile_brief": profile_brief_text,
+        "default_difficulty": default_difficulty,
         "intent": intent,
         "response_guidance": response_guidance,
         "context_needs": context_needs,
@@ -540,6 +552,27 @@ async def _route_intent(
     if domain == "mentor":
         return await mentor_handle(agent_context)
     return await varc_handle(agent_context)
+
+
+async def _resolve_profile_brief(
+    student_id: str, context_needs: Optional[dict],
+) -> str:
+    """Pick the right profile brief based on planner's context_needs.
+
+    Slice 5 wiring:
+    - context_needs is None (deterministic action, no planner call) → minimal
+    - context_needs.profile == "skip" or "none" → empty string
+    - context_needs.profile == "full" → full tutor brief (cached, ~400-700 tokens)
+    - else (default / "minimal") → minimal brief (cached, ~50-100 tokens)
+    """
+    if context_needs is None:
+        return await get_minimal_brief(student_id)
+    profile_pref = (context_needs or {}).get("profile", "minimal")
+    if profile_pref in ("skip", "none"):
+        return ""
+    if profile_pref == "full":
+        return await get_tutor_brief(student_id)
+    return await get_minimal_brief(student_id)
 
 
 # ─── Step 6.7: orchestrator-direct actions ──────────────────────────────────
@@ -734,7 +767,11 @@ async def _build_retry_response(student_id: str, tg_id: int, session_id: str) ->
         "tg_id": tg_id,
         "session_id": session_id,
         "recent_turns": [],
+        # Slice 5: thread default_difficulty so a retried practice_request
+        # respects the student's preparation_stage instead of defaulting to
+        # "medium" via VARC's final fallback.
         "profile_brief": await get_minimal_brief(student_id),
+        "default_difficulty": await get_default_difficulty(student_id),
         "current_unanswered_attempt": last_unanswered,
         "current_message": {"content": "", "content_type": "text", "message_id": None},
     }

@@ -10,14 +10,19 @@
 #   - Every LLM call is logged to v5.llm_calls.
 #
 # Slice 4 changes:
-#   - intent.subskill / intent.difficulty supplied by planner drive retrieval
-#     (DEFAULT_SUBSKILL / DEFAULT_DIFFICULTY only used when planner returns null
-#     or when a deterministic action like v5_continue_next has no skill hint).
+#   - intent.subskill / intent.difficulty supplied by planner drive retrieval.
 #   - intent.secondary_signal + response_guidance flow into the explanation
 #     LLM prompt for tone calibration (Bug 15).
 #   - "v5fail" free-text test trigger removed — real LLM error handling now
 #     wraps every openrouter call and returns _error_fallback_response on
 #     failure. To exercise the fallback path, break OPENROUTER_API_KEY.
+#
+# Slice 5 changes:
+#   - Difficulty fallback chain now: intent.difficulty (planner) →
+#     context.default_difficulty (profile-derived, threaded by orchestrator
+#     from profile_service.get_default_difficulty) → "medium" (defensive
+#     final fallback). The slice-2-era hardcoded DEFAULT_DIFFICULTY
+#     constant is gone (Bug 23).
 #
 # Preserved from slice 2.5 + 3:
 #   - 6-tier retrieval ladder
@@ -41,7 +46,11 @@ from shared.telegram.utils import escape_html
 logger = logging.getLogger(__name__)
 
 DEFAULT_SUBSKILL = "inference_basic"
-DEFAULT_DIFFICULTY = "medium"
+# DEFAULT_DIFFICULTY removed in slice 5: replaced by profile-derived
+# context.default_difficulty (Bug 23). The remaining "medium" inside
+# _handle_practice_request is a defensive final fallback for the case where
+# both the planner and the profile lookup return null — should never trigger
+# in practice once profiles are populated.
 STALE_REPEAT_DAYS = 7
 
 TIER5_PREFIX = "We've seen this passage before — let's try it with fresh eyes."
@@ -99,12 +108,20 @@ async def _handle_practice_request(context: dict, prefix: Optional[str] = None) 
     student_id = context["student_id"]
     session_id = context.get("session_id")
     intent = context.get("intent") or {}
-    # Slice 4: planner supplies subskill/difficulty when the student's message
-    # specifies them. Fall back to inference_basic / medium when planner left
-    # them null (or when a deterministic action like v5_continue_next is the
-    # source — in that case the next-question intent has no skill preference).
+    # Slice 5 difficulty resolution chain (Bug 23):
+    #   1. intent.difficulty — planner extracted it from the student's message
+    #      (e.g., "give me an easy one")
+    #   2. context.default_difficulty — orchestrator wrote it from
+    #      profile_service.get_default_difficulty(preparation_stage)
+    #   3. "medium" — defensive fallback when both upstream values are null.
+    # Subskill: planner-supplied or DEFAULT_SUBSKILL for cold-start /
+    # deterministic-action paths (e.g., v5_continue_next has no skill hint).
     subskill = intent.get("subskill") or DEFAULT_SUBSKILL
-    difficulty = intent.get("difficulty") or DEFAULT_DIFFICULTY
+    difficulty = (
+        intent.get("difficulty")
+        or context.get("default_difficulty")
+        or "medium"
+    )
     question, tier = await _retrieve_with_fallback(
         student_id=student_id,
         subskill=subskill,
