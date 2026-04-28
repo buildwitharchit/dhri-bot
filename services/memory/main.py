@@ -202,32 +202,54 @@ async def _open_session(student_id: str, *, primary_agent: str) -> str:
 
 
 async def close_session(session_id: str, end_reason: str) -> None:
+    """Close a session: UPDATE Postgres + DEL Redis state atomically.
+
+    Per Principle 3 invariant — every session-close path inherits Redis
+    cleanup automatically. Callers should NOT manually call
+    clear_active_session after close_session; that's now redundant.
+
+    COALESCE on ended_at/end_reason makes double-close a safe no-op:
+    the first close stamps the timestamp + reason; subsequent calls
+    don't overwrite. Idempotent even under double-call races.
+    """
+    # Look up tg_id BEFORE the UPDATE so we can DEL Redis even if the
+    # session is already closed (e.g. resolve_session boundary path
+    # racing with the cron).
+    row = await db.fetchrow(
+        """
+        SELECT st.tg_id
+        FROM v5.sessions s
+        JOIN v5.students st ON st.student_id = s.student_id
+        WHERE s.session_id = $1::uuid
+        """,
+        session_id,
+    )
+
     await db.execute(
         """
         UPDATE v5.sessions
-        SET ended_at = now(), end_reason = $2
-        WHERE session_id = $1::uuid AND ended_at IS NULL
+        SET ended_at = COALESCE(ended_at, now()),
+            end_reason = COALESCE(end_reason, $2)
+        WHERE session_id = $1::uuid
         """,
         session_id, end_reason,
     )
 
+    if row and row["tg_id"] is not None:
+        await clear_active_session(row["tg_id"])
+
 
 async def cleanup_inactive_sessions() -> int:
     """Cron entry point. Closes any session whose last_activity_at is older
-    than SESSION_GAP_MINUTES, clears the owning student's Redis active state,
-    then runs the (slice-3-stub) post-close pipeline.
+    than SESSION_GAP_MINUTES, then runs the (slice-3-stub) post-close pipeline.
 
-    Per Principle 3 / Bug 13: closing a session in Postgres without also
-    clearing state:tg:{tg_id} leaves Redis pointing at a closed session.
-    The next request's resolve_session would still detect the boundary and
-    recover, but only the cron + the user's next message together close the
-    loop — the cron alone leaves the Redis state stale for that window.
-    Clearing per-session keeps Redis in sync with Postgres at cron time."""
+    Redis cleanup is no longer manual here — close_session itself handles
+    the DEL of state:tg:{tg_id} per its updated contract (Principle 3
+    invariant). See close_session above."""
     rows = await db.fetch(
         f"""
-        SELECT s.session_id, st.tg_id
+        SELECT s.session_id
         FROM v5.sessions s
-        JOIN v5.students st ON st.student_id = s.student_id
         WHERE s.ended_at IS NULL
           AND s.last_activity_at < now() - interval '{SESSION_GAP_MINUTES} minutes'
         """
@@ -236,16 +258,10 @@ async def cleanup_inactive_sessions() -> int:
     for row in rows:
         sid = str(row["session_id"])
         await close_session(sid, "inactivity_timeout")
-        if row["tg_id"] is not None:
-            # Only DEL the specific tg_id whose session was just closed.
-            await clear_active_session(row["tg_id"])
         await process_session_end(sid)
         closed += 1
     if closed:
-        logger.info(
-            "v5 cleanup: closed %d inactive session(s) and cleared Redis state",
-            closed,
-        )
+        logger.info("v5 cleanup: closed %d inactive session(s)", closed)
     return closed
 
 
